@@ -1,6 +1,8 @@
 <div align="center">
 
-# PlantPulse
+<img src="assets/hero.svg" alt="PlantPulse" width="100%"/>
+
+<img src="https://readme-typing-svg.demolab.com?font=Inter&weight=700&size=22&duration=2600&pause=900&color=38BDF8&center=true&vCenter=true&width=900&lines=QR-kiosk+attendance%2C+offline-first;Payroll%2C+shifts%2C+inventory%2C+production+and+QC;Built+for+a+300%2B+employee+plant" alt="typing"/>
 
 **One pulse for your whole plant: people, stock, production and quality.**
 
@@ -47,13 +49,16 @@ Design references live in [`design/screens`](design/screens): owner dashboard, m
 
 ## Architecture
 
-```
-Android kiosk (Compose, Room, WorkManager)  --punches (offline queue, idempotent)-->
-Browser (Next.js App Router, React 19)      -->  API routes (thin)
-                                                   -->  server modules (RBAC gate + audit log)
-                                                         -->  Prisma 7 --> Supabase Postgres
-                                                         -->  S3-compatible storage (files, photos)
-Supabase Auth: email/password, TOTP MFA, invite-only onboarding
+```mermaid
+flowchart LR
+  K[Android kiosk<br/>Compose · Room · WorkManager] -- offline queue, idempotent punches --> API
+  B[Browser<br/>Next.js 16 · React 19] --> API[API routes - thin]
+  API --> S[Server modules<br/>RBAC gate + audit log]
+  S --> P[(Supabase Postgres<br/>via Prisma 7)]
+  S --> O[(S3-compatible storage)]
+  A[Supabase Auth<br/>MFA · invites] --> API
+  style K fill:#7f52ff,color:#fff
+  style P fill:#3ecf8e,color:#000
 ```
 
 ## Built by
