@@ -1,0 +1,117 @@
+import { isUuid } from '@/lib/mis/ids';
+import { toPlain } from '@/lib/mis/plain';
+import { requireMisAccess } from '@/server/mis/guard';
+import { getOrder, getOrderCloseGates, getOrderCloseOverride } from '@/server/mis/orders';
+import { canOverrideCloseGates } from '@/lib/mis/order-transitions';
+import { OrderStatusActions } from '@/components/mis/orders/order-status-actions';
+import { getBom } from '@/server/mis/bom';
+import { getProductionForOrder, getProductionSummary } from '@/server/mis/production';
+import { getPhasesForOrder } from '@/server/mis/job-phases';
+import { getQcForOrder, getQcSummary } from '@/server/mis/qc';
+import { listDocuments } from '@/server/mis/documents';
+import { getMisRole } from '@/server/mis/roles';
+import { can } from '@/lib/mis/permissions';
+import { OrderDetailDesktop } from '@/components/mis/desktop/order-detail-desktop';
+import { OrderDetailScreen } from '@/components/mis/orders/order-detail-screen';
+import { getOrderDesktopView } from '@/server/mis/order-desktop';
+import { getOrderAllocations } from '@/server/mis/order-allocation';
+import { notFound } from 'next/navigation';
+
+export default async function OrderDetailPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ view?: string }>;
+}) {
+  const { id } = await params;
+  if (!isUuid(id)) notFound();
+  const { view } = await searchParams;
+  const user = await requireMisAccess();
+  const role = await getMisRole(user.id);
+
+  const order = await getOrder(id);
+  if (!order) notFound();
+
+  const [bom, productionLogs, productionSummary, qcLogs, qcSummary, phases, documents, allocations] = await Promise.all([
+    getBom(id).catch(() => null),
+    getProductionForOrder(id).catch(() => []),
+    getProductionSummary(id).catch(() => ({ totalProduced: 0, totalWaste: 0, entries: 0, byUnit: [] })),
+    getQcForOrder(id).catch(() => []),
+    getQcSummary(id).catch(() => ({ total: 0, pass: 0, fail: 0 })),
+    // Deliberately NOT caught to an empty list like its neighbours: an empty
+    // list renders "No phase plan · not gated" (D10), so swallowing a failure
+    // here would make the screen claim a gate is absent when it may not be.
+    // Every role that can reach this page holds phase.read; if that ever stops
+    // being true, this should break loudly rather than lie.
+    // R3 B64: a role without phase.read (STORE_GUY) gets no phase section at all, rather than a false "No phase plan".
+    can(role, 'phase.read') ? getPhasesForOrder(id) : Promise.resolve([]),
+    listDocuments(id).catch(() => []),
+    getOrderAllocations(id).catch(() => []),
+  ]);
+
+  const canWrite = can(role, 'orders.write');
+  const canSeeWages = can(role, 'wages.read');
+  const canProduction = can(role, 'production.read');
+  const canQc = can(role, 'qc.read');
+
+  // Complete / deliver / cancel: absent (not greyed) without orders.write. Gates are only needed
+  // while the order can still be completed.
+  const statusActions = canWrite ? (
+    <OrderStatusActions
+      orderId={order.id}
+      orderNumber={order.orderNumber}
+      status={order.status}
+      gates={order.status === 'IN_PRODUCTION' ? await getOrderCloseGates(id) : []}
+      canOverride={canOverrideCloseGates(role ?? '')}
+      canStartWithoutBom={role === 'OWNER'} // R2-267
+      override={order.status === 'COMPLETED' || order.status === 'DELIVERED' ? await getOrderCloseOverride(id) : null}
+    />
+  ) : undefined;
+
+  // D4 from 1024px up; the existing screen below it. `?view=classic` keeps the full screen (production
+  // and QC logs, reopen) reachable on a desktop, because D4 deliberately carries neither.
+  const desktop = view === 'classic' ? null : await getOrderDesktopView(id);
+
+  const phone = (
+    <OrderDetailScreen
+      order={{ ...order, quantity: order.quantity == null ? null : Number(order.quantity) }} // R2-264: Decimal -> number for the client
+      phases={phases.map((p) => ({
+        id: p.id,
+        sequence: p.sequence,
+        status: p.status,
+        processName: p.process.name,
+        inChargeName: p.inCharge?.name ?? null,
+        downstreamFlagged: p.downstreamFlagged,
+      }))}
+      bom={toPlain(bom)}
+      productionLogs={productionLogs.map((l) => ({
+        ...l,
+        qtyProduced: Number(l.qtyProduced),
+        qtyWaste: Number(l.qtyWaste),
+      }))}
+      productionSummary={productionSummary}
+      qcLogs={qcLogs}
+      qcSummary={qcSummary}
+      documents={documents}
+      allocations={allocations}
+      statusActions={statusActions}
+      canWrite={canWrite}
+      canSeeWages={canSeeWages}
+      canProduction={canProduction}
+      canQc={canQc}
+      showPhases={can(role, 'phase.read')}
+    />
+  );
+
+  if (!desktop) return phone;
+
+  return (
+    <>
+      <div className="lg:hidden">{phone}</div>
+      <div className="hidden lg:block">
+        <OrderDetailDesktop data={desktop} statusActions={statusActions} />
+      </div>
+    </>
+  );
+}

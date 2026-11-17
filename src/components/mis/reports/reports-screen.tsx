@@ -1,0 +1,416 @@
+'use client';
+import { useState } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { DataTable, type Column } from '@/components/mis/kit/data-table';
+import { StatusBadge, type BadgeTone } from '@/components/mis/kit/status-badge';
+import { RangeTabs } from '@/components/mis/kit/range-tabs';
+import { Button } from '@/components/mis/kit/button';
+import { Card } from '@/components/mis/kit/card';
+import { CountUp } from '@/components/mis/kit/count-up';
+import { SpotlightCard } from '@/components/mis/kit/spotlight-card';
+import { formatQty } from '@/lib/mis/qty-by-unit';
+import type { KeyRange } from '@/lib/mis/report-range';
+
+type ProductionData = {
+  rows: { orderNumber: string; description: string | null; unit: string; produced: number; waste: number; entries: number }[];
+  /** Per unit (B76): never one mixed figure. */
+  totals?: { unit: string; produced: number; waste: number; wastePct: number | null }[];
+  raw: unknown[];
+};
+type AttendanceData = { rows: { name: string; code: string; dept: string; present: number; absent: number; late: number; ot: number }[]; raw: unknown[] };
+type QcData = { rows: { orderNumber: string; pass: number; fail: number; na: number }[]; raw: unknown[] };
+type StoreItemRow = { id: string; name: string; code: string; unit: string; pricePerUnit?: number | null; totalIn: number; totalOut: number; txnCount: number };
+type StoreData = { rows: StoreItemRow[]; raw: unknown[] };
+type MachineUtilisationRow = { machineId: string; code: string; name: string; isActive: boolean; bookedMinutes: number; allocationCount: number; percent: number };
+type MachineData = { rows: MachineUtilisationRow[]; availableMinutes: number; totals: { bookedMinutes: number; allocationCount: number; machineCount: number } };
+type OrderRow = { id: string; orderNumber: string; customer: { name: string } | null; description: string | null; status: string; deliveryDate: string | Date | null };
+
+type Tab = 'production' | 'attendance' | 'qc' | 'orders' | 'store' | 'machines';
+export type ReportSection = Tab;
+
+const SECTION_LABEL: Record<Tab, string> = {
+  production: 'production',
+  attendance: 'attendance',
+  qc: 'quality',
+  orders: 'orders',
+  store: 'store',
+  machines: 'machines',
+};
+
+const INR_2DP = new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2 });
+const INR_0DP = new Intl.NumberFormat('en-IN', { minimumFractionDigits: 0 });
+
+/** `dd/mm/yyyy` of a stored calendar date (UTC midnight in the DB), with no browser-zone shift. */
+function dayLabel(d: string | Date | null | undefined): string {
+  if (!d) return '';
+  const key = (typeof d === 'string' ? d : d.toISOString()).slice(0, 10);
+  return `${key.slice(8, 10)}/${key.slice(5, 7)}/${key.slice(0, 4)}`;
+}
+
+type Props = {
+  /** B78: sections whose query failed; the others still render. */
+  failed?: Partial<Record<Tab, string>>;
+  /** B83: set only for a holder of both reports.read and inventory.read. */
+  legacyIssuesHref?: string;
+  production: ProductionData;
+  attendance: AttendanceData;
+  qc: QcData;
+  orders: OrderRow[];
+  store: StoreData;
+  machines: MachineData;
+  canSeeWages: boolean;
+  isOwner: boolean;
+  rangeLabel: string;
+  /** R8 T4: the shared day/week/month/quarter/year range; without it the screen keeps the old month arrows. */
+  range?: KeyRange;
+  /** The other URL params the range tabs keep, so a desktop on `?view=classic` stays on this screen. */
+  rangeParams?: Record<string, string | undefined>;
+  year: number;
+  month: number;
+};
+
+/** 420 → "7.0h"; honest about a figure that is booked time, not output (E7-11). */
+function hoursLabel(minutes: number): string {
+  return `${(minutes / 60).toFixed(1)}h`;
+}
+
+function statusTone(s: string): BadgeTone {
+  switch (s) {
+    case 'CONFIRMED': return 'info';
+    case 'IN_PRODUCTION': return 'warning';
+    case 'COMPLETE': return 'good';
+    case 'CANCELLED': return 'critical';
+    default: return 'neutral';
+  }
+}
+
+function downloadCsv(filename: string, rows: string[][], headers: string[]) {
+  const lines = [headers, ...rows].map(r => r.map(c => `"${String(c ?? '').replace(/"/g, '""')}"`).join(','));
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+export function ReportsScreen({ production, attendance, qc, orders, store, machines, canSeeWages: _canSeeWages, isOwner, rangeLabel, range, rangeParams, year, month, failed = {}, legacyIssuesHref }: Props) {
+  const [tab, setTab] = useState<Tab>('production');
+  const router = useRouter();
+
+  const tabs: { key: Tab; label: string }[] = [
+    { key: 'production', label: 'Production' },
+    { key: 'attendance', label: 'Attendance' },
+    { key: 'qc', label: 'Quality' },
+    { key: 'orders', label: 'Orders' },
+    { key: 'store', label: 'Store' },
+    { key: 'machines', label: 'Machines' },
+  ];
+
+  function nav(newYear: number, newMonth: number) {
+    router.push(`/mis/reports?year=${newYear}&month=${newMonth}`);
+  }
+
+  function prevMonth() {
+    if (month === 1) nav(year - 1, 12);
+    else nav(year, month - 1);
+  }
+
+  function nextMonth() {
+    if (month === 12) nav(year + 1, 1);
+    else nav(year, month + 1);
+  }
+
+  const prodCols: Column<(typeof production.rows)[0]>[] = [
+    { key: 'orderNumber', header: 'Order', render: r => <span className="font-mono text-sm">{r.orderNumber}</span> },
+    { key: 'description', header: 'Description', render: r => r.description ?? '—' },
+    { key: 'produced', header: 'Produced', render: r => <span className="font-medium">{formatQty(r.produced)} {r.unit}</span> },
+    { key: 'waste', header: 'Waste', render: r => `${formatQty(r.waste)} ${r.unit}` },
+    { key: 'entries', header: 'Log Entries', render: r => r.entries.toString() },
+    { key: 'yield', header: 'Yield %', render: r => {
+      if (!r.produced) return '—';
+      return `${(((r.produced - r.waste) / r.produced) * 100).toFixed(1)}%`;
+    }},
+  ];
+
+  const attCols: Column<(typeof attendance.rows)[0]>[] = [
+    { key: 'name', header: 'Employee', render: r => r.name },
+    { key: 'code', header: 'Code', render: r => <span className="font-mono text-sm">{r.code}</span> },
+    { key: 'dept', header: 'Department', render: r => r.dept },
+    { key: 'present', header: 'Present', render: r => <span className="text-green-600 font-medium">{r.present}</span> },
+    { key: 'absent', header: 'Absent', render: r => <span className={r.absent > 0 ? 'text-red-600 font-medium' : ''}>{r.absent}</span> },
+    { key: 'late', header: 'Late', render: r => r.late.toString() },
+    { key: 'ot', header: 'OT Days', render: r => r.ot.toString() },
+  ];
+
+  const qcCols: Column<(typeof qc.rows)[0]>[] = [
+    { key: 'orderNumber', header: 'Order', render: r => <span className="font-mono text-sm">{r.orderNumber}</span> },
+    { key: 'pass', header: 'PASS', render: r => <span className="text-green-600 font-medium">{r.pass}</span> },
+    { key: 'fail', header: 'FAIL', render: r => <span className={r.fail > 0 ? 'text-red-600 font-medium' : ''}>{r.fail}</span> },
+    { key: 'na', header: 'N/A', render: r => r.na.toString() },
+    { key: 'rate', header: 'Pass Rate', render: r => {
+      const total = r.pass + r.fail;
+      if (!total) return '—';
+      return `${((r.pass / total) * 100).toFixed(0)}%`;
+    }},
+  ];
+
+  const orderCols: Column<OrderRow>[] = [
+    { key: 'orderNumber', header: 'Order #', render: r => <span className="font-mono text-sm">{r.orderNumber}</span> },
+    { key: 'customer', header: 'Customer', render: r => r.customer?.name ?? '—' },
+    { key: 'description', header: 'Description', render: r => r.description ?? '—' },
+    { key: 'status', header: 'Status', render: r => <StatusBadge tone={statusTone(r.status)}>{r.status.replace(/_/g,' ')}</StatusBadge> },
+    { key: 'deliveryDate', header: 'Delivery', render: r => dayLabel(r.deliveryDate) || '—' },
+  ];
+
+  const prodTotals = production.totals ?? [];
+  const totPresent =attendance.rows.reduce((s, r) => s + r.present, 0);
+  const totAbsent = attendance.rows.reduce((s, r) => s + r.absent, 0);
+  const totQcPass = qc.rows.reduce((s, r) => s + r.pass, 0);
+  const totQcNa = qc.rows.reduce((s, r) => s + r.na, 0);
+  const totQcFail = qc.rows.reduce((s, r) => s + r.fail, 0);
+  const totStoreIn = store.rows.reduce((s, r) => s + r.totalIn, 0);
+  const totStoreOut = store.rows.reduce((s, r) => s + r.totalOut, 0);
+  const totStoreValue = isOwner ? store.rows.reduce((s, r) => s + (r.pricePerUnit ?? 0) * r.totalIn, 0) : null;
+  const avgMachineUtilisation = machines.rows.length > 0 ? Math.round(machines.rows.reduce((s, r) => s + r.percent, 0) / machines.rows.length) : null;
+
+  const machineCols: Column<MachineUtilisationRow>[] = [
+    { key: 'name', header: 'Machine', render: r => <span className="font-medium">{r.name}{!r.isActive && <span className="ml-2 text-xs text-slate-500">(currently inactive)</span>}</span> },
+    { key: 'code', header: 'Code', render: r => <span className="font-mono text-sm">{r.code}</span> },
+    { key: 'bookedMinutes', header: 'Booked', render: r => hoursLabel(r.bookedMinutes) },
+    { key: 'allocationCount', header: 'Bookings', render: r => r.allocationCount.toString() },
+    { key: 'percent', header: 'Utilisation', render: r => (
+      <div className="flex items-center gap-2">
+        <div className="h-2 w-20 overflow-hidden rounded-full bg-slate-100">
+          <div className={`h-full ${r.percent >= 70 ? 'bg-green-500' : r.percent >= 30 ? 'bg-amber-500' : 'bg-slate-300'}`} style={{ width: `${r.percent}%` }} />
+        </div>
+        <span className="font-medium">{r.percent}%</span>
+      </div>
+    ) },
+  ];
+
+  const storeCols: Column<StoreItemRow>[] = [
+    { key: 'name', header: 'Item', render: r => <span className="font-medium">{r.name}</span> },
+    { key: 'code', header: 'Code', render: r => <span className="font-mono text-sm">{r.code}</span> },
+    { key: 'unit', header: 'Unit', render: r => r.unit || '—' },
+    { key: 'totalIn', header: 'IN Qty', render: r => <span className="text-green-600 font-medium">{formatQty(r.totalIn)}</span> },
+    { key: 'totalOut', header: 'OUT Qty', render: r => <span className="text-amber-600 font-medium">{formatQty(r.totalOut)}</span> },
+    { key: 'txnCount', header: 'Txns', render: r => r.txnCount.toString() },
+    ...(isOwner ? [{
+      key: 'value' as const,
+      header: 'IN Value (₹)',
+      render: (r: StoreItemRow) => r.pricePerUnit != null
+        ? `₹${INR_2DP.format(r.pricePerUnit * r.totalIn)}`
+        : '—',
+    }] : []),
+  ];
+
+  function handleExport() {
+    const filename = range ? `report-${range.freq}-${range.fromKey}-${tab}.csv` : `report-${year}-${String(month).padStart(2, '0')}-${tab}.csv`;
+    if (tab === 'production') {
+      const headers = ['Order', 'Description', 'Unit', 'Produced', 'Waste', 'Log Entries', 'Yield %'];
+      const rows = production.rows.map(r => [
+        r.orderNumber, r.description ?? '', r.unit, String(r.produced), String(r.waste), String(r.entries),
+        r.produced ? (((r.produced - r.waste) / r.produced) * 100).toFixed(1) : '0',
+      ]);
+      downloadCsv(filename, rows, headers);
+    } else if (tab === 'attendance') {
+      const headers = ['Employee', 'Code', 'Department', 'Present', 'Absent', 'Late', 'OT Days'];
+      const rows = attendance.rows.map(r => [r.name, r.code, r.dept, String(r.present), String(r.absent), String(r.late), String(r.ot)]);
+      downloadCsv(filename, rows, headers);
+    } else if (tab === 'qc') {
+      const headers = ['Order', 'PASS', 'FAIL', 'N/A', 'Pass Rate %'];
+      const rows = qc.rows.map(r => {
+        const total = r.pass + r.fail;
+        return [r.orderNumber, String(r.pass), String(r.fail), String(r.na), total ? ((r.pass / total) * 100).toFixed(0) : '0'];
+      });
+      downloadCsv(filename, rows, headers);
+    } else if (tab === 'store') {
+      const headers = isOwner
+        ? ['Item', 'Code', 'Unit', 'IN Qty', 'OUT Qty', 'Txns', 'IN Value (₹)']
+        : ['Item', 'Code', 'Unit', 'IN Qty', 'OUT Qty', 'Txns'];
+      const rows = store.rows.map(r => {
+        const base = [r.name, r.code, r.unit, String(r.totalIn), String(r.totalOut), String(r.txnCount)];
+        if (isOwner) base.push(r.pricePerUnit != null ? (r.pricePerUnit * r.totalIn).toFixed(2) : '');
+        return base;
+      });
+      downloadCsv(filename, rows, headers);
+    } else if (tab === 'machines') {
+      const headers = ['Machine', 'Code', 'Booked (h)', 'Bookings', 'Utilisation %'];
+      const rows = machines.rows.map(r => [r.name, r.code, (r.bookedMinutes / 60).toFixed(1), String(r.allocationCount), String(r.percent)]);
+      downloadCsv(filename, rows, headers);
+    } else {
+      const headers = ['Order #', 'Customer', 'Description', 'Status', 'Delivery Date'];
+      const rows = orders.map(r => [
+        r.orderNumber, r.customer?.name ?? '', r.description ?? '', r.status,
+        dayLabel(r.deliveryDate),
+      ]);
+      downloadCsv(filename, rows, headers);
+    }
+  }
+
+  return (
+    <div className="p-6">
+      {/* Header with month nav */}
+      <div className="flex items-center justify-between mb-6 flex-wrap gap-3">
+        <h1 className="text-2xl font-bold tracking-tight text-slate-900">Reports</h1>
+        {/* `flex-wrap`: prev/label/next + CSV/Print don't fit a 390px phone screen in one row
+            (5 controls, min-w-[120px] label alone) — wraps onto a second row instead of
+            pushing the page wider. */}
+        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-3">
+          {range ? (
+            <RangeTabs basePath="/mis/reports" range={range} params={rangeParams} />
+          ) : (
+            <>
+              <button onClick={prevMonth} aria-label="Previous month" className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg hover:bg-slate-100 text-slate-500 text-lg">←</button>
+              <span className="font-medium text-slate-700 min-w-[120px] text-center">{rangeLabel}</span>
+              <button onClick={nextMonth} aria-label="Next month" className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg hover:bg-slate-100 text-slate-500 text-lg">→</button>
+            </>
+          )}
+          <Button variant="secondary" onClick={handleExport} className="ml-2 px-3 text-sm">
+            ↓ CSV
+          </Button>
+          <Button variant="secondary" onClick={() => window.print()} className="px-3 text-sm">
+            ⎙ Print
+          </Button>
+        </div>
+      </div>
+
+      {legacyIssuesHref && (
+        <p className="mb-4 text-sm">
+          <Link href={legacyIssuesHref} className="inline-flex min-h-11 items-center text-indigo-700 hover:underline">Legacy store issues not linked to an order →</Link>
+        </p>
+      )}
+
+      {/* Summary stat tiles */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+        <SpotlightCard className="mis-rise p-4">
+          <p className="text-xs text-slate-500 uppercase tracking-wide">Production</p>
+          {/* B76: one figure per unit, never a mixed total. */}
+          <p className="text-2xl font-bold mt-1">{prodTotals.length === 0 ? '0' : prodTotals.map(t => formatQty(t.produced)).join(' / ')}</p>
+          <p className="text-xs text-slate-500">{prodTotals.length === 0 ? 'produced' : `${prodTotals.map(t => t.unit).join(' / ')} produced`}</p>
+        </SpotlightCard>
+        <SpotlightCard className="mis-rise p-4">
+          <p className="text-xs text-slate-500 uppercase tracking-wide">Waste</p>
+          <p className="text-2xl font-bold mt-1">{prodTotals.length === 0 ? '0' : prodTotals.map(t => formatQty(t.waste)).join(' / ')}</p>
+          <p className="text-xs text-slate-500">{prodTotals.length === 0 ? 'waste' : prodTotals.map(t => `${t.unit}${t.wastePct == null ? '' : ` (${t.wastePct}%)`}`).join(' / ')} waste (of total input)</p>
+        </SpotlightCard>
+        <SpotlightCard className="mis-rise p-4">
+          <p className="text-xs text-slate-500 uppercase tracking-wide">Attendance</p>
+          <p className="text-2xl font-bold mt-1 text-green-700"><CountUp value={totPresent} /></p>
+          <p className="text-xs text-slate-500">present / {totAbsent} absent</p>
+        </SpotlightCard>
+        <SpotlightCard className="mis-rise p-4">
+          <p className="text-xs text-slate-500 uppercase tracking-wide">QC Pass Rate</p>
+          <p className="text-2xl font-bold mt-1">{totQcPass + totQcFail === 0 ? '—' : `${((totQcPass / (totQcPass + totQcFail)) * 100).toFixed(0)}%`}</p>
+          <p className="text-xs text-slate-500">{totQcPass} pass / {totQcFail} fail{totQcNa > 0 ? ` · N/A: ${totQcNa}` : ''}</p>
+        </SpotlightCard>
+        <Card raised className="mis-rise">
+          <p className="text-xs text-slate-500 uppercase tracking-wide">Store IN</p>
+          <p className="text-2xl font-bold mt-1 text-green-600">{formatQty(totStoreIn)}</p>
+          <p className="text-xs text-slate-500">units received in this range</p>
+        </Card>
+        <Card raised className="mis-rise">
+          <p className="text-xs text-slate-500 uppercase tracking-wide">Store OUT</p>
+          <p className="text-2xl font-bold mt-1 text-amber-600">{formatQty(totStoreOut)}</p>
+          <p className="text-xs text-slate-500">units issued in this range</p>
+        </Card>
+        {isOwner && totStoreValue !== null && (
+          <Card raised className="mis-rise">
+            <p className="text-xs text-slate-500 uppercase tracking-wide">Store IN Value</p>
+            <p className="text-2xl font-bold mt-1">₹{INR_0DP.format(totStoreValue)}</p>
+            <p className="text-xs text-slate-500">value of items received</p>
+          </Card>
+        )}
+        <Card raised className="mis-rise">
+          <p className="text-xs text-slate-500 uppercase tracking-wide">Machine Utilisation</p>
+          <p className="text-2xl font-bold mt-1">{avgMachineUtilisation === null ? '—' : `${avgMachineUtilisation}%`}</p>
+          <p className="text-xs text-slate-500">average across {machines.rows.length} machine{machines.rows.length === 1 ? '' : 's'}, booked time only</p>
+        </Card>
+      </div>
+
+      {/* Tab bar. `overflow-x-auto`: six tabs (five plus Machines, E7-11) don't fit a 390px
+          phone screen — scrolls inside its own row instead of blowing out the page width. */}
+      <div className="flex gap-1 mb-6 overflow-x-auto scrollbar-none border-b border-slate-200">
+        {tabs.map(t => (
+          <button
+            key={t.key}
+            onClick={() => setTab(t.key)}
+            className={`mis-press inline-flex min-h-11 shrink-0 items-center whitespace-nowrap px-4 text-sm font-medium border-b-2 transition-colors ${
+              tab === t.key
+                ? 'border-indigo-600 text-indigo-700'
+                : 'border-transparent text-slate-500 hover:text-slate-700'
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {failed[tab] && (
+        <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          Could not load {SECTION_LABEL[tab]}. The other sections are unaffected; reload to try again.
+        </p>
+      )}
+      {tab === 'production' && !failed.production && (
+        <DataTable
+          columns={prodCols}
+          rows={production.rows}
+          rowKey={r => `${r.orderNumber}|${r.unit}`}
+          emptyTitle="No production data"
+          emptyBody="No logs found for this period."
+        />
+      )}
+      {tab === 'attendance' && !failed.attendance && (
+        <DataTable
+          columns={attCols}
+          rows={attendance.rows}
+          rowKey={r => r.code}
+          emptyTitle="No attendance data"
+          emptyBody="No attendance records found for this period."
+        />
+      )}
+      {tab === 'qc' && !failed.qc && (
+        <DataTable
+          columns={qcCols}
+          rows={qc.rows}
+          rowKey={r => r.orderNumber}
+          emptyTitle="No QC data"
+          emptyBody="No QC checks found for this period."
+        />
+      )}
+      {tab === 'orders' && !failed.orders && (
+        <DataTable
+          columns={orderCols}
+          rows={orders}
+          rowKey={r => r.id}
+          emptyTitle="No orders"
+          emptyBody="No orders created in this period."
+        />
+      )}
+      {tab === 'store' && !failed.store && (
+        <DataTable
+          columns={storeCols}
+          rows={store.rows}
+          rowKey={r => r.id}
+          emptyTitle="No store transactions"
+          emptyBody="No store movements found for this period."
+        />
+      )}
+      {tab === 'machines' && !failed.machines && (
+        <>
+          <p className="text-xs text-slate-500 mb-3">
+            Booked time against the available hours in {rangeLabel} — not actual running time, and not a claim about when a machine was down (no record exists for that yet).
+          </p>
+          <DataTable
+            columns={machineCols}
+            rows={machines.rows}
+            rowKey={r => r.machineId}
+            emptyTitle="No machines"
+            emptyBody="No machines have been added to the masters yet."
+          />
+        </>
+      )}
+    </div>
+  );
+}

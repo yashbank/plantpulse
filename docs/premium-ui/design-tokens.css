@@ -1,0 +1,84 @@
+/* MIS premium design tokens (PROPOSAL, tokens only). Paste into globals.css inside `.mis-light { }`
+ * (or a new `.mis-premium` block imported after it). No hex: Tailwind v4 theme vars only.
+ * Dark-ready: a later `.mis-dark` block re-declares ONLY the --mis-* values; components never change. */
+.mis-light {
+  /* 1. Surfaces (page < card < raised < hero) */
+  --mis-page: var(--color-slate-50);
+  --mis-page-wash: radial-gradient(60rem 28rem at 12% -8%, color-mix(in oklab, var(--color-indigo-500) 8%, transparent), transparent 70%),
+                   radial-gradient(44rem 24rem at 100% 0%, color-mix(in oklab, var(--color-sky-400) 7%, transparent), transparent 70%);
+  --mis-card: var(--color-white);
+  --mis-card-quiet: color-mix(in oklab, var(--color-white) 70%, var(--color-slate-50));
+  --mis-raised: var(--color-white);
+  --mis-hero: linear-gradient(135deg, var(--color-indigo-600), var(--color-indigo-800));
+  --mis-hero-ink: var(--color-white);
+  --mis-overlay: color-mix(in oklab, var(--color-slate-900) 40%, transparent);
+
+  /* Borders, glow, rings */
+  --mis-border: var(--color-slate-200);
+  --mis-border-strong: var(--color-slate-300);
+  --mis-border-hover: color-mix(in oklab, var(--color-indigo-500) 35%, transparent);
+  --mis-glow: 0 0 0 4px color-mix(in oklab, var(--color-indigo-500) 14%, transparent);
+  --mis-ring: var(--color-indigo-600);
+  --mis-hairline: inset 0 1px 0 color-mix(in oklab, var(--color-white) 70%, transparent);
+
+  /* Elevation (existing --shadow-card/-elevated/-float stay; aliases only) */
+  --mis-shadow-0: none;
+  --mis-shadow-1: var(--shadow-card);
+  --mis-shadow-2: var(--shadow-elevated);
+  --mis-shadow-3: var(--shadow-float);
+
+  /* Radii */
+  --mis-r-chip: 9999px;
+  --mis-r-control: 0.75rem;   /* buttons, inputs: 12px */
+  --mis-r-card: 1rem;         /* cards: 16px */
+  --mis-r-hero: 1.25rem;      /* hero, slide-over: 20px */
+
+  /* 2. Colour roles: fg (AA on its bg), bg tint, line */
+  --mis-primary: var(--color-indigo-600);       --mis-primary-hover: var(--color-indigo-700);
+  --mis-primary-bg: var(--color-indigo-50);     --mis-primary-line: var(--color-indigo-200);
+  --mis-success: var(--color-emerald-700);      --mis-success-bg: var(--color-emerald-50);  --mis-success-line: var(--color-emerald-200);
+  --mis-warning: var(--color-amber-900);        --mis-warning-bg: var(--color-amber-50);    --mis-warning-line: var(--color-amber-200);
+  --mis-danger: var(--color-red-700);           --mis-danger-bg: var(--color-red-50);       --mis-danger-line: var(--color-red-200);
+  --mis-info: var(--color-sky-800);             --mis-info-bg: var(--color-sky-50);         --mis-info-line: var(--color-sky-200);
+  --mis-money: var(--color-indigo-800);         --mis-money-bg: var(--color-indigo-50);     /* OWNER-only values */
+  --mis-ink: var(--color-slate-900);
+  --mis-ink-2: var(--color-slate-600);          /* 7:1 on white */
+  --mis-ink-3: var(--color-slate-500);          /* 4.8:1, labels only >= 12px */
+  /* Module accents: dot/chip glyph ONLY, text stays --mis-ink. Chip bg = -100, dot = -500. */
+  --mis-mod-production: var(--color-indigo-500);  --mis-mod-production-bg: var(--color-indigo-100);
+  --mis-mod-quality: var(--color-emerald-500);    --mis-mod-quality-bg: var(--color-emerald-100);
+  --mis-mod-store: var(--color-amber-500);        --mis-mod-store-bg: var(--color-amber-100);
+  --mis-mod-people: var(--color-sky-500);         --mis-mod-people-bg: var(--color-sky-100);
+  --mis-mod-purchasing: var(--color-violet-500);  --mis-mod-purchasing-bg: var(--color-violet-100);
+
+  /* 3. Type (font-sans Geist, font-mono Geist Mono) */
+  --mis-fs-display: 2.25rem;  --mis-fs-h1: 1.5rem;  --mis-fs-h2: 1.125rem;
+  --mis-fs-body: 1rem;        --mis-fs-small: 0.875rem; --mis-fs-label: 0.6875rem;
+  --mis-fw-display: 700;  --mis-fw-heading: 650;  --mis-fw-body: 400;  --mis-fw-label: 600;
+  --mis-tracking-tight: -0.02em;  --mis-tracking-label: 0.06em;
+  --mis-num: tabular-nums;
+
+  /* 4. Motion: one curve, four durations */
+  --mis-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --mis-d-fast: 120ms;   /* press, tint, colour */
+  --mis-d-base: 180ms;   /* hover, menu, toast */
+  --mis-d-slow: 260ms;   /* slide-over, sheet, lift */
+  --mis-d-enter: 380ms;  /* page enter, hero */
+  --mis-stagger: 40ms;   /* per child, max 6 steps */
+  --mis-press-scale: 0.98;
+  --mis-tap-min: 2.75rem; /* 44px */
+  --mis-press-tint: color-mix(in oklab, var(--color-indigo-600) 10%, transparent);
+  --mis-shimmer-base: var(--color-slate-100);
+  --mis-shimmer-peak: var(--color-slate-50);
+}
+
+/* Optional page wash: put `mis-wash` on the page container. Static gradient, no animation, no blur. */
+.mis-light .mis-wash { background-color: var(--mis-page); background-image: var(--mis-page-wash); }
+
+@keyframes mis-page-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes mis-progress { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+@keyframes mis-shimmer-x { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .mis-light { --mis-d-fast: 0ms; --mis-d-base: 0ms; --mis-d-slow: 0ms; --mis-d-enter: 0ms; --mis-stagger: 0ms; --mis-press-scale: 1; }
+}

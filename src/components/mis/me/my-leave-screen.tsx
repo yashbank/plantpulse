@@ -1,0 +1,136 @@
+'use client';
+
+import { PageHeader } from '@/components/mis/kit/page-header';
+import { useRouter } from 'next/navigation';
+import { useState, useTransition } from 'react';
+
+import { cancelLeaveRequestAction, requestLeaveAction } from '@/app/(mis)/mis/attendance/actions';
+import { Button } from '@/components/mis/kit/button';
+import { DateInput, Input } from '@/components/mis/kit/input';
+import { Select, type SelectOption } from '@/components/mis/kit/select';
+import { EmptyState } from '@/components/mis/kit/empty-state';
+import { SlideOver } from '@/components/mis/kit/slide-over';
+import { StatusBadge } from '@/components/mis/kit/status-badge';
+import { useToast } from '@/components/ui/toast';
+import { formatFactoryDate } from '@/lib/mis/factory-time';
+import { HALF_DAY_LEAVE, LEAVE_TYPES, LEAVE_TYPE_LABEL, leaveTypeLabel, validateLeaveRange } from '@/lib/mis/leave';
+
+/** R2-220 — a plain shape: ISO strings, no Date, no employee (these are all my own). */
+export type MyLeaveRow = { id: string; date: string; endDate: string | null; leaveType: string; status: string; reason: string | null };
+
+const TONE: Record<string, 'good' | 'warning' | 'critical' | 'neutral'> = {
+  APPROVED: 'good',
+  PENDING: 'warning',
+  REJECTED: 'critical',
+  CANCELLED: 'neutral',
+};
+
+const TYPE_OPTIONS: SelectOption[] = [
+  ...LEAVE_TYPES.map((t) => ({ value: t, label: LEAVE_TYPE_LABEL[t] })),
+  { value: HALF_DAY_LEAVE, label: leaveTypeLabel(HALF_DAY_LEAVE) },
+];
+
+const day = (iso: string) => formatFactoryDate(new Date(iso), 'UTC');
+
+export function MyLeaveScreen({ employeeId, leaves }: { employeeId: string; leaves: MyLeaveRow[] }) {
+  const [open, setOpen] = useState(false);
+  const [leaveType, setLeaveType] = useState('CL');
+  const [date, setDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [reason, setReason] = useState('');
+  const [isPending, startTransition] = useTransition();
+  const { toast } = useToast();
+  const router = useRouter();
+
+  const isHalfDay = leaveType === HALF_DAY_LEAVE;
+  const rangeError = date && !isHalfDay ? validateLeaveRange(date, endDate || null) : null;
+
+  const apply = () =>
+    startTransition(async () => {
+      const res = await requestLeaveAction(employeeId, date, reason || undefined, {
+        endDate: isHalfDay ? null : endDate || null,
+        leaveType,
+      });
+      if (!res.ok) { toast('error', res.detail); return; }
+      setDate(''); setEndDate(''); setReason(''); setLeaveType('CL'); setOpen(false);
+      router.refresh();
+    });
+
+  const withdraw = (id: string) =>
+    startTransition(async () => {
+      const res = await cancelLeaveRequestAction(id);
+      if (!res.ok) toast('error', res.detail);
+      else router.refresh();
+    });
+
+  // R2-240: an approved leave that has not started yet can still be cancelled by me, with a reason (the server re-checks the date).
+  const [cancelFor, setCancelFor] = useState<MyLeaveRow | null>(null);
+  const [cancelReason, setCancelReason] = useState('');
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const notStarted = (l: MyLeaveRow) => l.date.slice(0, 10) > todayKey;
+  const cancelApproved = () =>
+    startTransition(async () => {
+      if (!cancelFor) return;
+      const res = await cancelLeaveRequestAction(cancelFor.id, cancelReason);
+      if (!res.ok) { toast('error', res.detail); return; }
+      setCancelFor(null); setCancelReason('');
+      router.refresh();
+    });
+
+  return (
+    <div className="mx-auto flex w-full max-w-[420px] flex-col gap-3 pb-24 md:max-w-3xl">
+      <PageHeader title="My leave" className="mis-rise mb-0" actions={<Button onClick={() => setOpen(true)}>Apply for leave</Button>} />
+
+      {leaves.length === 0 ? (
+        <EmptyState title="No leave requests yet." />
+      ) : (
+        <ul className="mis-rise divide-y divide-slate-100 rounded-2xl border border-slate-200 bg-white shadow-card">
+          {leaves.map((l) => (
+            <li key={l.id} className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
+              <div className="min-w-0">
+                <div className="font-medium text-slate-900">
+                  {day(l.date)}{l.endDate ? ` – ${day(l.endDate)}` : ''}
+                </div>
+                <div className="text-xs text-slate-500">{leaveTypeLabel(l.leaveType)}{l.reason ? ` · ${l.reason}` : ''}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <StatusBadge tone={TONE[l.status] ?? 'neutral'}>{l.status}</StatusBadge>
+                {l.status === 'PENDING' && (
+                  <Button variant="ghost" onClick={() => withdraw(l.id)} disabled={isPending}>Withdraw</Button>
+                )}
+                {l.status === 'APPROVED' && notStarted(l) && (
+                  <Button variant="ghost" onClick={() => { setCancelFor(l); setCancelReason(''); }} disabled={isPending}>Cancel</Button>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <SlideOver open={!!cancelFor} onClose={() => setCancelFor(null)} title="Cancel approved leave">
+        <div className="flex flex-col gap-4 p-4">
+          <p className="text-sm text-slate-600">{cancelFor ? `${day(cancelFor.date)}${cancelFor.endDate ? ` – ${day(cancelFor.endDate)}` : ''}` : ''} · this leave has not started, so you can take it back. Say why.</p>
+          <Input label="Reason" value={cancelReason} onChange={(e) => setCancelReason(e.target.value)} />
+          <div className="flex gap-2">
+            <Button onClick={cancelApproved} disabled={isPending || cancelReason.trim().length < 3}>Cancel this leave</Button>
+            <Button variant="ghost" onClick={() => setCancelFor(null)}>Keep it</Button>
+          </div>
+        </div>
+      </SlideOver>
+
+      <SlideOver open={open} onClose={() => setOpen(false)} title="Apply for leave">
+        <div className="flex flex-col gap-4 p-4">
+          <Select label="Leave type" value={leaveType} options={TYPE_OPTIONS} onChange={setLeaveType} />
+          <DateInput label="From" value={date} onChange={(e) => setDate(e.target.value)} />
+          {!isHalfDay && <DateInput label="To (leave blank for a single day)" value={endDate} onChange={(e) => setEndDate(e.target.value)} />}
+          {rangeError && <p role="alert" className="text-sm text-red-600">{rangeError}</p>}
+          <Input label="Reason (optional)" value={reason} onChange={(e) => setReason(e.target.value)} />
+          <div className="flex gap-2 pt-2">
+            <Button onClick={apply} disabled={isPending || !date || !!rangeError}>Submit</Button>
+            <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
+          </div>
+        </div>
+      </SlideOver>
+    </div>
+  );
+}

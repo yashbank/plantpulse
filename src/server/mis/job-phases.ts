@@ -1,0 +1,1151 @@
+import type { MisJobPhaseStatus } from '@/generated/prisma/enums';
+import { BPR_WORKFLOW, processNameKey } from '@/lib/mis/bpr-workflow';
+import { db } from '@/server/db';
+import { requirePermission, type MisActor } from '@/server/mis/auth';
+import { logAuditEvent } from '@/server/mis/audit';
+import { flushReleaseAudit, releaseMachineAllocations, type ReleaseAuditEvent } from '@/server/mis/allocation-release';
+import { isOrderClosed } from '@/lib/mis/order-status';
+import { NO_UNIT, normaliseUnit, sumByUnit } from '@/lib/mis/qty-by-unit';
+
+/**
+ * The phase sign-off and handover gate.
+ *
+ * The specification is DEVELOPMENT_GUIDE.md **Appendix A** — states, the legal
+ * transitions, who may perform each, the sequential rule, and the database
+ * constraints that back all of it up. If this file and Appendix A disagree,
+ * this file is wrong.
+ *
+ * TRANSITIONS below is the one and only transition table. The moment a second
+ * `if (phase.status === ...)` gate appears somewhere else, the two drift and
+ * the gate has a hole (MIS-145).
+ *
+ * This module deliberately never calls `assertLineCleared` (D7). Line clearance
+ * asks "is this machine fit to run"; the phase gate asks "is this order's route
+ * at this step". They are independent preconditions on the same write and are
+ * kept that way so either can change without the other (Appendix A §A.8).
+ */
+
+/** Work may be recorded against a phase in these states, and only these. */
+const ACTIVE_STATUSES: MisJobPhaseStatus[] = ['IN_PROGRESS', 'REOPENED'];
+
+/**
+ * REOPENED is active exactly like IN_PROGRESS and distinct from it in the
+ * record — a phase signed once and withdrawn must never again look like one
+ * that was never signed (Appendix A §A.2).
+ */
+export function isActiveStatus(status: MisJobPhaseStatus): boolean {
+  return ACTIVE_STATUSES.includes(status);
+}
+
+type TransitionVerb =
+  | 'startPhase'
+  | 'signOffPhase'
+  | 'markNotApplicable'
+  | 'restorePhase'
+  | 'reopenPhase';
+
+/** Appendix A §A.3. Anything not in this table is illegal for everybody. */
+const TRANSITIONS: ReadonlyArray<{
+  from: MisJobPhaseStatus;
+  to: MisJobPhaseStatus;
+  verb: TransitionVerb;
+}> = [
+  { from: 'PENDING', to: 'IN_PROGRESS', verb: 'startPhase' },
+  { from: 'PENDING', to: 'NOT_APPLICABLE', verb: 'markNotApplicable' },
+  { from: 'IN_PROGRESS', to: 'SIGNED_OFF', verb: 'signOffPhase' },
+  { from: 'IN_PROGRESS', to: 'NOT_APPLICABLE', verb: 'markNotApplicable' },
+  { from: 'SIGNED_OFF', to: 'REOPENED', verb: 'reopenPhase' },
+  { from: 'NOT_APPLICABLE', to: 'PENDING', verb: 'restorePhase' },
+  { from: 'REOPENED', to: 'SIGNED_OFF', verb: 'signOffPhase' },
+];
+
+export type JobPhaseRefusal =
+  | 'ALREADY_IN_STATE'
+  | 'ILLEGAL_TRANSITION'
+  | 'PREVIOUS_PHASE_NOT_SIGNED_OFF'
+  | 'NOT_THE_IN_CHARGE'
+  | 'NO_IN_CHARGE'
+  | 'NO_PRODUCTION_RECORDED'
+  | 'WASTE_REASON_MISSING'
+  | 'QC_FAILURE_UNACKNOWLEDGED'
+  | 'HANDOVER_NOTE_REQUIRED'
+  | 'PRODUCTION_ALREADY_RECORDED'
+  | 'LATER_PHASE_STARTED'
+  | 'REASON_REQUIRED'
+  | 'NO_ACTIVE_PHASE'
+  | 'AMBIGUOUS_ACTIVE_PHASE'
+  | 'PHASE_NOT_FOUND';
+
+/**
+ * A refused transition, carrying why.
+ *
+ * `reason` is what callers branch on; `message` is what a person reads and it
+ * always names the next action — the blocking phase and the person who can
+ * unblock it (MIS-146). A refusal with no next action produces a phone call,
+ * and enough phone calls produce a workaround.
+ *
+ * Phase 11: `ALREADY_IN_STATE` is your replay signal. A re-delivered sign-off
+ * that refuses with it has already succeeded — retire it from the queue rather
+ * than parking it.
+ */
+export class JobPhaseError extends Error {
+  constructor(
+    readonly reason: JobPhaseRefusal,
+    message: string,
+    readonly detail?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = 'JobPhaseError';
+  }
+}
+
+export function isJobPhaseError(error: unknown): error is JobPhaseError {
+  return error instanceof JobPhaseError || (error as Error)?.name === 'JobPhaseError';
+}
+
+function assertTransition(from: MisJobPhaseStatus, to: MisJobPhaseStatus, verb: TransitionVerb) {
+  if (from === to) {
+    throw new JobPhaseError(
+      'ALREADY_IN_STATE',
+      `This phase is already ${humanStatus(to)}.`,
+      { from, to },
+    );
+  }
+  const legal = TRANSITIONS.some((t) => t.from === from && t.to === to && t.verb === verb);
+  if (!legal) {
+    throw new JobPhaseError(
+      'ILLEGAL_TRANSITION',
+      `A phase cannot go from ${humanStatus(from)} to ${humanStatus(to)}.`,
+      { from, to, verb },
+    );
+  }
+}
+
+function humanStatus(status: MisJobPhaseStatus): string {
+  return status.toLowerCase().replace(/_/g, ' ');
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+const phaseInclude = {
+  process: { select: { id: true, name: true, nameHi: true, code: true } },
+  inCharge: { select: { id: true, name: true, employeeCode: true, userProfileId: true } },
+  order: { select: { id: true, orderNumber: true } },
+} as const;
+
+type PhaseWithRefs = Awaited<ReturnType<typeof loadPhase>>;
+
+async function loadPhase(phaseId: string) {
+  const phase = await db.misJobPhase.findFirst({
+    where: { id: phaseId, deletedAt: null },
+    include: phaseInclude,
+  });
+  if (!phase) {
+    throw new JobPhaseError('PHASE_NOT_FOUND', 'That phase no longer exists.', { phaseId });
+  }
+  return phase;
+}
+
+/**
+ * Phases signed off, against phases that apply, for several orders at once.
+ *
+ * D1's "Orders in flight" shows "2 of 7" and says why: "Phases complete, not a guessed
+ * percentage." A percentage derived from dates or from status would be a guess; this is the
+ * count the sign-off gate itself works from.
+ *
+ * ONE query for every order asked about — a list of twenty orders must not be twenty round
+ * trips (S8). `NOT_APPLICABLE` phases are excluded from the denominator, the same rule the
+ * gate in Appendix A applies when it looks for the previous phase.
+ */
+export async function countPhasesForOrders(
+  orderIds: readonly string[],
+): Promise<Map<string, { done: number; total: number }>> {
+  await requirePermission('phase.read');
+  const counts = new Map<string, { done: number; total: number }>();
+  if (orderIds.length === 0) return counts;
+
+  const rows = await db.misJobPhase.findMany({
+    where: { orderId: { in: [...orderIds] }, deletedAt: null, status: { not: 'NOT_APPLICABLE' } },
+    select: { orderId: true, status: true },
+  });
+
+  for (const row of rows) {
+    const entry = counts.get(row.orderId) ?? { done: 0, total: 0 };
+    entry.total += 1;
+    if (row.status === 'SIGNED_OFF') entry.done += 1;
+    counts.set(row.orderId, entry);
+  }
+
+  return counts;
+}
+
+/** Every phase on an order, in running order. An empty list is a real answer (D10). */
+export async function getPhasesForOrder(orderId: string) {
+  await requirePermission('phase.read');
+  return db.misJobPhase.findMany({
+    where: { orderId, deletedAt: null },
+    include: phaseInclude,
+    orderBy: { sequence: 'asc' },
+  });
+}
+
+/**
+ * The previous phase that still counts — nearest lower sequence, skipping
+ * NOT_APPLICABLE, ignoring soft-deleted rows. A skipped phase must never block
+ * the next one (MIS-145). Mirrors the trigger's own lookup exactly.
+ */
+async function previousApplicablePhase(orderId: string, sequence: number) {
+  return db.misJobPhase.findFirst({
+    where: {
+      orderId,
+      deletedAt: null,
+      sequence: { lt: sequence },
+      status: { not: 'NOT_APPLICABLE' },
+    },
+    include: phaseInclude,
+    orderBy: { sequence: 'desc' },
+  });
+}
+
+function describeHolder(phase: { inCharge: { name: string } | null }): string {
+  return phase.inCharge ? `${phase.inCharge.name}` : 'nobody yet — it needs an in-charge';
+}
+
+// ---------------------------------------------------------------------------
+// Identity — D12
+// ---------------------------------------------------------------------------
+
+/**
+ * Is this actor the phase's in-charge?
+ *
+ * The in-charge is an employee; the actor is an auth user. `userProfileId` is
+ * the unique bridge, the same one `getMisRole` walks.
+ */
+function isInCharge(phase: PhaseWithRefs, actor: MisActor): boolean {
+  return phase.inCharge?.userProfileId != null && phase.inCharge.userProfileId === actor.userId;
+}
+
+/** R2-330: who may sign a phase off on the in-charge's behalf (with a reason). */
+function canSignOnBehalf(actor: MisActor): boolean {
+  return actor.role === 'OWNER' || actor.role === 'ADMIN';
+}
+
+async function employeeForActor(actor: MisActor) {
+  return db.misEmployee.findUnique({
+    where: { userProfileId: actor.userId },
+    select: { id: true, name: true },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Transitions
+// ---------------------------------------------------------------------------
+
+/**
+ * Start a phase. The sequential gate lives here and in the database trigger;
+ * this one produces the message a person reads (MIS_UI_SPEC.md §7.1).
+ *
+ * An unassigned phase takes the starter as its in-charge (D12) — the default
+ * that always resolves, in a factory where most supervisors have no login.
+ */
+export async function startPhase(phaseId: string) {
+  const actor = await requirePermission('phase.write');
+  const phase = await loadPhase(phaseId);
+  assertTransition(phase.status, 'IN_PROGRESS', 'startPhase');
+
+  const blocker = await previousApplicablePhase(phase.orderId, phase.sequence);
+  if (blocker && blocker.status !== 'SIGNED_OFF') {
+    throw new JobPhaseError(
+      'PREVIOUS_PHASE_NOT_SIGNED_OFF',
+      `${phase.process.name} cannot start until ${blocker.process.name} is signed off — it is still with ${describeHolder(blocker)}.`,
+      { blockingPhaseId: blocker.id, blockingProcess: blocker.process.name, blockingStatus: blocker.status },
+    );
+  }
+
+  const mine = await employeeForActor(actor);
+  const inChargeEmployeeId = phase.inChargeEmployeeId ?? mine?.id ?? null;
+  if (!inChargeEmployeeId) {
+    throw new JobPhaseError(
+      'NO_IN_CHARGE',
+      `${phase.process.name} has no in-charge, and you have no employee record to become one. An admin must assign one before it can start.`,
+      { phaseId },
+    );
+  }
+
+  const rec = await db.misJobPhase.update({
+    where: { id: phaseId },
+    data: {
+      status: 'IN_PROGRESS',
+      startedAt: new Date(),
+      startedById: actor.userId,
+      inChargeEmployeeId,
+    },
+  });
+
+  await logAuditEvent({
+    actorId: actor.userId,
+    action: 'START_PHASE',
+    entity: 'MisJobPhase',
+    entityId: rec.id,
+    before: { status: phase.status },
+    after: { status: rec.status, inChargeEmployeeId, orderId: rec.orderId, sequence: rec.sequence },
+  });
+  return rec;
+}
+
+export type SignOffBlocker =
+  | { kind: 'NO_PRODUCTION' }
+  | { kind: 'WASTE_REASON'; logId: string; loggedAt: Date; qtyWaste: number; unit?: string }
+  | { kind: 'QC_FAILURE'; checkId: string; parameterName: string | null; checkTime: Date };
+
+/**
+ * Everything standing between this phase and a signature, as data rather than
+ * an exception — so the screen can list all of them at once instead of
+ * surfacing them one refused submit at a time (MIS-164).
+ */
+export async function getSignOffBlockers(phaseId: string): Promise<SignOffBlocker[]> {
+  await requirePermission('phase.read');
+  const phase = await loadPhase(phaseId);
+  return collectSignOffBlockers(phase);
+}
+
+async function collectSignOffBlockers(phase: PhaseWithRefs): Promise<SignOffBlocker[]> {
+  const blockers: SignOffBlocker[] = [];
+
+  const logs = await db.misProductionLog.findMany({
+    where: { jobPhaseId: phase.id, voidedAt: null },
+    select: { id: true, qtyWaste: true, wasteReason: true, loggedAt: true, unit: true },
+    orderBy: { loggedAt: 'asc' },
+  });
+
+  if (logs.length === 0) blockers.push({ kind: 'NO_PRODUCTION' });
+
+  for (const log of logs) {
+    const waste = Number(log.qtyWaste ?? 0);
+    if (waste > 0 && !log.wasteReason?.trim()) {
+      blockers.push({ kind: 'WASTE_REASON', logId: log.id, loggedAt: log.loggedAt, qtyWaste: waste, unit: log.unit });
+    }
+  }
+
+  for (const check of await unacknowledgedFailures(phase)) {
+    blockers.push({
+      kind: 'QC_FAILURE',
+      checkId: check.id,
+      parameterName: check.parameterName,
+      checkTime: check.checkTime,
+    });
+  }
+
+  return blockers;
+}
+
+/**
+ * Failed QC checks belonging to this phase.
+ *
+ * A check is tied to a stage, not a phase — so a phase built from a BOM stage
+ * owns that stage's checks, and one built without a stage owns the order's
+ * unattributed checks. Acknowledged is not resolved (MIS-163): a check stays
+ * FAIL for ever, and `acknowledgedAt` records that someone knew and passed the
+ * job on anyway.
+ */
+async function unacknowledgedFailures(phase: { orderId: string; bomStageId: string | null }) {
+  return db.misQcCheck.findMany({
+    where: {
+      orderId: phase.orderId,
+      bomStageId: phase.bomStageId,
+      result: 'FAIL',
+      voidedAt: null,
+      acknowledgedAt: null,
+    },
+    select: { id: true, parameterName: true, checkTime: true },
+    orderBy: { checkTime: 'asc' },
+  });
+}
+
+/**
+ * Sign a phase off. **Only the in-charge** — not an admin, not the Owner
+ * (D12). A signature someone else can apply is not a signature; the Owner's
+ * lever is `reassignInCharge`.
+ *
+ * The timestamp is the server's, always. No argument carries one, and Phase 11
+ * must stamp a replayed sign-off when it replays, not when it was queued.
+ */
+export async function signOffPhase(phaseId: string, input?: { notes?: string; reason?: string }) {
+  const actor = await requirePermission('phase.write');
+  const phase = await loadPhase(phaseId);
+  assertTransition(phase.status, 'SIGNED_OFF', 'signOffPhase');
+
+  // R2-330: an Admin or the Owner may sign on the in-charge's behalf, with a reason that goes to the audit trail.
+  const onBehalfReason = input?.reason?.trim() ?? '';
+  const signsOnBehalf = !isInCharge(phase, actor);
+  if (signsOnBehalf) {
+    if (!canSignOnBehalf(actor)) {
+      throw new JobPhaseError(
+        'NOT_THE_IN_CHARGE',
+        phase.inCharge
+          ? `Only ${phase.inCharge.name} can sign off ${phase.process.name}. Ask an admin to re-assign it if they are unavailable.`
+          : `${phase.process.name} has no in-charge, so nobody can sign it off yet. An admin must assign one.`,
+        { phaseId, inCharge: phase.inCharge?.name ?? null },
+      );
+    }
+    if (onBehalfReason.length < 3) {
+      throw new JobPhaseError(
+        'REASON_REQUIRED',
+        `You are not the in-charge of ${phase.process.name}. Give a reason (3+ characters) to sign it off on their behalf.`,
+        { phaseId, inCharge: phase.inCharge?.name ?? null },
+      );
+    }
+  }
+
+  const blockers = await collectSignOffBlockers(phase);
+  const first = blockers[0];
+  if (first) throw refusalForBlocker(phase, first, blockers);
+
+  // R2-295: a skipped upstream stage must be explained in the handover, not left to the audit reader to guess.
+  if (!input?.notes?.trim()) {
+    const skipped = await db.misJobPhase.count({
+      where: { orderId: phase.orderId, deletedAt: null, sequence: { lt: phase.sequence }, status: 'NOT_APPLICABLE' },
+    });
+    if (skipped > 0) {
+      throw new JobPhaseError(
+        'HANDOVER_NOTE_REQUIRED',
+        `${skipped === 1 ? 'An earlier phase was' : `${skipped} earlier phases were`} marked not applicable. Write a handover note saying why before signing off ${phase.process.name}.`,
+        { phaseId, skipped },
+      );
+    }
+  }
+
+  const signedOffAt = new Date();
+  const next = await nextApplicablePhase(phase.orderId, phase.sequence);
+  const notifyUserId = next?.inCharge?.userProfileId ?? null;
+
+  // R3-ORD contract (PR #90): the release helpers hand back `auditEvents` and the caller flushes
+  // them AFTER commit - nothing inside this interactive tx may touch the global db or audit.
+  let releaseAudit: ReleaseAuditEvent[] = [];
+  const rec = await db.$transaction(async (tx) => {
+    const updated = await tx.misJobPhase.update({
+      where: { id: phaseId },
+      data: {
+        status: 'SIGNED_OFF',
+        signedOffAt,
+        signedOffById: actor.userId,
+        notes: input?.notes ?? phase.notes,
+      },
+    });
+
+    // #42/#44 + R3 B118 — signing a phase off frees the machine it held AND its crew, in this
+    // same transaction (a rolled-back sign-off never leaves them released). Already-released rows
+    // keep their stamp. Reopening a phase deliberately does NOT re-lock.
+    const held = await tx.misMachineAllocation.findMany({
+      where: { jobPhaseId: phaseId, releasedAt: null },
+      select: { id: true },
+    });
+    const released = await releaseMachineAllocations(
+      tx,
+      held.map((h) => h.id),
+      { reason: 'PHASE_SIGNED_OFF', actorUserId: actor.userId, at: signedOffAt },
+    );
+    releaseAudit = released.auditEvents;
+
+    // Transactional on purpose: a notification that fires on a rolled-back
+    // sign-off tells the next section to start work that never unblocked.
+    // A next in-charge with no login gets no row — most supervisors in this
+    // factory have none, and that must not fail the sign-off.
+    if (notifyUserId && next) {
+      await tx.notification.create({
+        data: {
+          userId: notifyUserId,
+          type: 'mis.phase_ready',
+          payload: {
+            orderId: phase.orderId,
+            orderNumber: phase.order.orderNumber,
+            phaseId: next.id,
+            processName: next.process.name,
+            previousProcessName: phase.process.name,
+            signedOffAt: signedOffAt.toISOString(),
+          },
+        },
+      });
+    }
+
+    return updated;
+  });
+
+  await flushReleaseAudit(releaseAudit);
+  await logAuditEvent({
+    actorId: actor.userId,
+    action: 'SIGN_OFF_PHASE',
+    entity: 'MisJobPhase',
+    entityId: rec.id,
+    before: { status: phase.status },
+    after: {
+      status: rec.status,
+      signedOffAt: signedOffAt.toISOString(),
+      orderId: rec.orderId,
+      sequence: rec.sequence,
+      notifiedPhaseId: next?.id ?? null,
+      // R2-330: who the signature was applied for, and why, when it was not the in-charge's own.
+      ...(signsOnBehalf ? { signedOnBehalfOf: phase.inCharge?.name ?? null, reason: onBehalfReason } : {}),
+    },
+  });
+  return rec;
+}
+
+function refusalForBlocker(
+  phase: PhaseWithRefs,
+  blocker: SignOffBlocker,
+  all: SignOffBlocker[],
+): JobPhaseError {
+  const detail = { phaseId: phase.id, blockers: all.length };
+  switch (blocker.kind) {
+    case 'NO_PRODUCTION':
+      return new JobPhaseError(
+        'NO_PRODUCTION_RECORDED',
+        `Nothing has been recorded against ${phase.process.name}, so there is nothing to sign for.`,
+        detail,
+      );
+    case 'WASTE_REASON':
+      return new JobPhaseError(
+        'WASTE_REASON_MISSING',
+        `${all.filter((b) => b.kind === 'WASTE_REASON').length} wastage entr${all.filter((b) => b.kind === 'WASTE_REASON').length === 1 ? 'y needs' : 'ies need'} a reason before ${phase.process.name} can be signed off.`,
+        detail,
+      );
+    case 'QC_FAILURE':
+      return new JobPhaseError(
+        'QC_FAILURE_UNACKNOWLEDGED',
+        `${phase.process.name} has a failed quality check that has not been acknowledged. Acknowledging it records that you know about it and are passing the job on anyway.`,
+        detail,
+      );
+  }
+}
+
+async function nextApplicablePhase(orderId: string, sequence: number) {
+  return db.misJobPhase.findFirst({
+    where: {
+      orderId,
+      deletedAt: null,
+      sequence: { gt: sequence },
+      status: { not: 'NOT_APPLICABLE' },
+    },
+    include: phaseInclude,
+    orderBy: { sequence: 'asc' },
+  });
+}
+
+/**
+ * Take a phase off this job's route, or put a started-by-mistake one back to
+ * rest. ADMIN/OWNER only — routing is a planning act (Appendix A §A.4).
+ * Refused once production exists: you cannot un-happen recorded work.
+ */
+export async function markNotApplicable(phaseId: string, reason: string) {
+  const actor = await requirePermission('phase.write');
+  if (actor.role !== 'OWNER' && actor.role !== 'ADMIN') {
+    throw new JobPhaseError(
+      'ILLEGAL_TRANSITION',
+      'Only an admin or the owner can take a phase off a job card.',
+      { role: actor.role },
+    );
+  }
+  const trimmed = reason?.trim();
+  if (!trimmed) {
+    throw new JobPhaseError('REASON_REQUIRED', 'Skipping a phase needs a reason.', { phaseId });
+  }
+
+  const phase = await loadPhase(phaseId);
+  assertTransition(phase.status, 'NOT_APPLICABLE', 'markNotApplicable');
+
+  const recorded = await db.misProductionLog.count({ where: { jobPhaseId: phaseId, voidedAt: null } });
+  if (recorded > 0) {
+    throw new JobPhaseError(
+      'PRODUCTION_ALREADY_RECORDED',
+      `${phase.process.name} already has ${recorded} production ${recorded === 1 ? 'entry' : 'entries'} against it, so it cannot be marked not applicable. Sign it off instead.`,
+      { phaseId, recorded },
+    );
+  }
+
+  const rec = await db.misJobPhase.update({
+    where: { id: phaseId },
+    data: { status: 'NOT_APPLICABLE', notApplicableReason: trimmed },
+  });
+  await logAuditEvent({
+    actorId: actor.userId,
+    action: 'SKIP_PHASE',
+    entity: 'MisJobPhase',
+    entityId: rec.id,
+    before: { status: phase.status },
+    after: { status: rec.status, reason: trimmed },
+  });
+  return rec;
+}
+
+/**
+ * Put a skipped phase back on the route. Refused once a later phase has
+ * started — restoring behind work already done opens a hole in the sequence
+ * the gate cannot close retroactively (Appendix A §A.3 note 2).
+ */
+export async function restorePhase(phaseId: string, reason: string) {
+  const actor = await requirePermission('phase.write');
+  if (actor.role !== 'OWNER' && actor.role !== 'ADMIN') {
+    throw new JobPhaseError(
+      'ILLEGAL_TRANSITION',
+      'Only an admin or the owner can put a phase back on a job card.',
+      { role: actor.role },
+    );
+  }
+  const trimmed = reason?.trim();
+  if (!trimmed) {
+    throw new JobPhaseError('REASON_REQUIRED', 'Restoring a phase needs a reason.', { phaseId });
+  }
+
+  const phase = await loadPhase(phaseId);
+  assertTransition(phase.status, 'PENDING', 'restorePhase');
+
+  const later = await db.misJobPhase.findFirst({
+    where: {
+      orderId: phase.orderId,
+      deletedAt: null,
+      sequence: { gt: phase.sequence },
+      status: { in: ['IN_PROGRESS', 'SIGNED_OFF', 'REOPENED'] },
+    },
+    include: phaseInclude,
+    orderBy: { sequence: 'asc' },
+  });
+  if (later) {
+    throw new JobPhaseError(
+      'LATER_PHASE_STARTED',
+      `${later.process.name} has already started, so ${phase.process.name} cannot be put back before it.`,
+      { phaseId, laterPhaseId: later.id },
+    );
+  }
+
+  const rec = await db.misJobPhase.update({
+    where: { id: phaseId },
+    data: { status: 'PENDING', notApplicableReason: null, notes: appendNote(phase.notes, `Restored: ${trimmed}`) },
+  });
+  await logAuditEvent({
+    actorId: actor.userId,
+    action: 'RESTORE_PHASE',
+    entity: 'MisJobPhase',
+    entityId: rec.id,
+    before: { status: phase.status },
+    after: { status: rec.status, reason: trimmed },
+  });
+  return rec;
+}
+
+/**
+ * Withdraw a signature. **Owner or Admin** (`phase.reopen`; Admin since R2-331), with a reason.
+ *
+ * Downstream phases are *flagged*, never cascaded: rewriting the status of
+ * phases people have already acted on would destroy their records to tidy up
+ * this one (MIS-146).
+ */
+export async function reopenPhase(phaseId: string, reason: string) {
+  const actor = await requirePermission('phase.reopen');
+  const trimmed = reason?.trim();
+  if (!trimmed) {
+    throw new JobPhaseError('REASON_REQUIRED', 'Reopening a signed phase needs a reason.', { phaseId });
+  }
+
+  const phase = await loadPhase(phaseId);
+  assertTransition(phase.status, 'REOPENED', 'reopenPhase');
+
+  const reopenedAt = new Date();
+  const { rec, flagged } = await db.$transaction(async (tx) => {
+    const updated = await tx.misJobPhase.update({
+      where: { id: phaseId },
+      data: {
+        status: 'REOPENED',
+        reopenReason: trimmed,
+        reopenedAt,
+        reopenedById: actor.userId,
+      },
+    });
+    const downstream = await tx.misJobPhase.updateMany({
+      where: {
+        orderId: phase.orderId,
+        deletedAt: null,
+        sequence: { gt: phase.sequence },
+        status: { not: 'NOT_APPLICABLE' },
+      },
+      data: { downstreamFlagged: true },
+    });
+    return { rec: updated, flagged: downstream.count };
+  });
+
+  await logAuditEvent({
+    actorId: actor.userId,
+    action: 'REOPEN_PHASE',
+    entity: 'MisJobPhase',
+    entityId: rec.id,
+    before: { status: phase.status, signedOffAt: phase.signedOffAt?.toISOString() ?? null },
+    after: { status: rec.status, reason: trimmed, downstreamFlagged: flagged },
+  });
+  return rec;
+}
+
+/**
+ * Move who signs. ADMIN/OWNER, audited, and the outgoing in-charge is on the
+ * record — this is the answer to "the signer left", and the only lever a
+ * manager has over a signature (D12).
+ */
+export async function reassignInCharge(phaseId: string, employeeId: string) {
+  const actor = await requirePermission('phase.write');
+  if (actor.role !== 'OWNER' && actor.role !== 'ADMIN') {
+    throw new JobPhaseError(
+      'ILLEGAL_TRANSITION',
+      'Only an admin or the owner can re-assign who signs off a phase.',
+      { role: actor.role },
+    );
+  }
+  const phase = await loadPhase(phaseId);
+  if (phase.status === 'SIGNED_OFF') {
+    throw new JobPhaseError(
+      'ILLEGAL_TRANSITION',
+      `${phase.process.name} is already signed off; re-assigning now would not change who signed it.`,
+      { phaseId },
+    );
+  }
+  const incoming = await db.misEmployee.findFirst({
+    where: { id: employeeId, deletedAt: null, isActive: true },
+    select: { id: true, name: true },
+  });
+  if (!incoming) {
+    throw new JobPhaseError('NO_IN_CHARGE', 'That employee is not available to take the phase.', { employeeId });
+  }
+
+  const rec = await db.misJobPhase.update({
+    where: { id: phaseId },
+    data: { inChargeEmployeeId: incoming.id },
+  });
+  await logAuditEvent({
+    actorId: actor.userId,
+    action: 'REASSIGN_PHASE_IN_CHARGE',
+    entity: 'MisJobPhase',
+    entityId: rec.id,
+    before: { inCharge: phase.inCharge?.name ?? null, inChargeEmployeeId: phase.inChargeEmployeeId },
+    after: { inCharge: incoming.name, inChargeEmployeeId: incoming.id },
+  });
+  return rec;
+}
+
+// ---------------------------------------------------------------------------
+// Preconditions the sign-off screen clears inline
+// ---------------------------------------------------------------------------
+
+/**
+ * Record that the in-charge knows about a failed check and is passing the job
+ * on anyway. This is **not** resolving it: the check stays FAIL for ever, and
+ * "resolved" remains a later PASS on the same stage, which is derived and not
+ * stored (MIS-163).
+ */
+export async function acknowledgeQcFailure(checkId: string, note?: string) {
+  // R2-311: its own action, so the QC role may acknowledge / waive without holding phase.write.
+  const actor = await requirePermission('qc.acknowledge');
+  const check = await db.misQcCheck.findUnique({ where: { id: checkId } });
+  // R2-34: a voided (deleted) check is gone for every purpose, acknowledging included.
+  if (!check || check.voidedAt) throw new JobPhaseError('PHASE_NOT_FOUND', 'That check no longer exists.', { checkId });
+  if (check.result !== 'FAIL') {
+    throw new JobPhaseError(
+      'ILLEGAL_TRANSITION',
+      'Only a failed check needs acknowledging.',
+      { checkId, result: check.result },
+    );
+  }
+  if (check.acknowledgedAt) return check;
+
+  // R3 B116 — a closed order's records are frozen.
+  const order = await db.misOrder.findUnique({ where: { id: check.orderId }, select: { status: true } });
+  if (order && isOrderClosed(order.status)) {
+    throw new JobPhaseError('ILLEGAL_TRANSITION', 'This order is closed, so its failed checks can no longer be acknowledged.', { checkId });
+  }
+
+  // R3 B116 — only the in-charge of the check's phase may acknowledge; OWNER/ADMIN may too,
+  // with a written note (>= 3 chars) so the override is accountable. R2-311: so may the QC role.
+  const trimmedNote = note?.trim() || '';
+  const privileged = actor.role === 'OWNER' || actor.role === 'ADMIN' || actor.role === 'QC';
+  // R2-310: a check logged without a stage belongs to the order, so the in-charge of any ACTIVE phase on it may acknowledge.
+  const phases = await db.misJobPhase.findMany({
+    where: check.bomStageId
+      ? { orderId: check.orderId, deletedAt: null, bomStageId: check.bomStageId }
+      : { orderId: check.orderId, deletedAt: null, status: { in: ACTIVE_STATUSES } },
+    include: phaseInclude,
+  });
+  const isPhaseInCharge = phases.some((p) => isInCharge(p, actor));
+  if (!isPhaseInCharge) {
+    if (!privileged) {
+      throw new JobPhaseError(
+        'NOT_THE_IN_CHARGE',
+        'Only the in-charge of this phase can acknowledge its failed check.',
+        { checkId },
+      );
+    }
+    if (trimmedNote.length < 3) {
+      throw new JobPhaseError('REASON_REQUIRED', "Add a note of at least 3 characters to acknowledge this failure on the in-charge's behalf.", { checkId });
+    }
+  }
+
+  const rec = await db.misQcCheck.update({
+    where: { id: checkId },
+    data: {
+      acknowledgedAt: new Date(),
+      acknowledgedById: actor.userId,
+      acknowledgementNote: trimmedNote || null,
+    },
+  });
+  await logAuditEvent({
+    actorId: actor.userId,
+    action: 'ACKNOWLEDGE_QC_FAILURE',
+    entity: 'MisQcCheck',
+    entityId: rec.id,
+    after: { acknowledgedAt: rec.acknowledgedAt?.toISOString() ?? null, note: rec.acknowledgementNote },
+  });
+  return rec;
+}
+
+/** Fill in a wastage reason the entry screen deliberately did not ask for (D11). */
+export async function setWasteReason(productionLogId: string, reason: string) {
+  const actor = await requirePermission('phase.write');
+  const trimmed = reason?.trim();
+  if (!trimmed) {
+    throw new JobPhaseError('REASON_REQUIRED', 'A wastage reason cannot be blank.', { productionLogId });
+  }
+  // R3 B115 — a typed not-found, and a signed record is frozen until its phase is reopened.
+  const log = await db.misProductionLog.findUnique({
+    where: { id: productionLogId },
+    select: { id: true, wasteReason: true, voidedAt: true, jobPhase: { select: { status: true } } },
+  });
+  if (!log || log.voidedAt) throw new JobPhaseError('PHASE_NOT_FOUND', 'That production entry no longer exists.', { productionLogId });
+  if (log.jobPhase?.status === 'SIGNED_OFF') {
+    throw new JobPhaseError('ILLEGAL_TRANSITION', 'Reopen the phase to change a signed record.', { productionLogId });
+  }
+  const rec = await db.misProductionLog.update({
+    where: { id: productionLogId },
+    data: { wasteReason: trimmed },
+  });
+  await logAuditEvent({
+    actorId: actor.userId,
+    action: 'SET_WASTE_REASON',
+    entity: 'MisProductionLog',
+    entityId: rec.id,
+    before: { wasteReason: log.wasteReason },
+    after: { wasteReason: trimmed },
+  });
+  return rec;
+}
+
+// ---------------------------------------------------------------------------
+// The summary the signature is a claim about
+// ---------------------------------------------------------------------------
+
+export type SignOffSummary = {
+  phaseId: string;
+  processName: string;
+  orderNumber: string;
+  status: MisJobPhaseStatus;
+  inChargeName: string | null;
+  canSign: boolean;
+  /** R2-330: true when `canSign` holds only because the viewer is an Admin/Owner, so a reason is required. */
+  signsOnBehalf: boolean;
+  output: number;
+  waste: number;
+  wastePercent: number | null;
+  entries: number;
+  unit: string;
+  /** R3 B124 - per-unit figures; `output`/`waste`/`unit` above are the first unit only. Never summed across units. */
+  byUnit: { unit: string; produced: number; waste: number; wastePercent: number | null }[];
+  /**
+   * What the previous signed phase handed over, which is what this phase's
+   * output is read against — the BPR's own "Received Sheets → Printed Sheets"
+   * columns. Orders carry no quantity field (D13).
+   */
+  handedOver: { processName: string; output: number } | null;
+  materials: { description: string; quantity: number; unit: string }[];
+  blockers: SignOffBlocker[];
+};
+
+/** Everything the screen must show *above* the confirm action (MIS-164). */
+export async function getSignOffSummary(phaseId: string): Promise<SignOffSummary> {
+  const actor = await requirePermission('phase.read');
+  const phase = await loadPhase(phaseId);
+
+  const [logs, blockers, previous] = await Promise.all([
+    db.misProductionLog.findMany({
+      where: { jobPhaseId: phaseId, voidedAt: null },
+      select: { qtyProduced: true, qtyWaste: true, unit: true },
+    }),
+    collectSignOffBlockers(phase),
+    previousApplicablePhase(phase.orderId, phase.sequence),
+  ]);
+
+  const producedBy = sumByUnit(logs.map((l) => ({ qty: Number(l.qtyProduced), unit: l.unit })));
+  const wasteBy = sumByUnit(logs.map((l) => ({ qty: Number(l.qtyWaste ?? 0), unit: l.unit })));
+  const byUnit = producedBy.map((p) => {
+    const w = wasteBy.find((x) => x.unit === p.unit)?.qty ?? 0;
+    return { unit: p.unit, produced: p.qty, waste: w, wastePercent: p.qty + w > 0 ? (w / (p.qty + w)) * 100 : null };
+  });
+  const first = byUnit[0] ?? { unit: 'KG', produced: 0, waste: 0, wastePercent: null };
+  const output = first.produced;
+  const waste = first.waste;
+
+  let handedOver: SignOffSummary['handedOver'] = null;
+  if (previous && previous.status === 'SIGNED_OFF') {
+    const previousLogs = await db.misProductionLog.findMany({
+      where: { jobPhaseId: previous.id, voidedAt: null },
+      select: { qtyProduced: true, unit: true },
+    });
+    const prevBy = sumByUnit(previousLogs.map((l) => ({ qty: Number(l.qtyProduced), unit: l.unit })));
+    handedOver = {
+      processName: previous.process.name,
+      output: prevBy.filter((x) => x.unit === first.unit || x.unit === NO_UNIT).reduce((n, x) => n + x.qty, 0),
+    };
+  }
+
+  const materials = phase.bomStageId
+    ? (
+        await db.misBomMaterial.findMany({
+          where: { stageId: phase.bomStageId },
+          select: { description: true, quantity: true, unit: true },
+          orderBy: { seq: 'asc' },
+        })
+      ).map((m) => ({ description: m.description, quantity: Number(m.quantity), unit: m.unit }))
+    : [];
+
+  return {
+    phaseId: phase.id,
+    processName: phase.process.name,
+    orderNumber: phase.order.orderNumber,
+    status: phase.status,
+    inChargeName: phase.inCharge?.name ?? null,
+    canSign: (isInCharge(phase, actor) || canSignOnBehalf(actor)) && blockers.length === 0 && isActiveStatus(phase.status),
+    // R2-330: the screen asks for a reason when the signer is not the in-charge.
+    signsOnBehalf: !isInCharge(phase, actor) && canSignOnBehalf(actor),
+    output,
+    waste,
+    wastePercent: first.wastePercent,
+    entries: logs.length,
+    // The legacy single `unit` keeps the stored spelling of the first unit's rows.
+    unit: logs.find((l) => normaliseUnit(l.unit) === first.unit)?.unit ?? first.unit,
+    byUnit,
+    handedOver,
+    materials,
+    blockers,
+  };
+}
+
+/**
+ * "Waiting on your sign-off" — filtered in the database, never in the browser
+ * (MIS-142 S8). Returns nothing for a user with no employee record, which is
+ * the correct answer rather than an error.
+ */
+export async function listPhasesAwaitingMySignOff(limit = 5) {
+  const actor = await requirePermission('phase.read');
+  const mine = await employeeForActor(actor);
+  if (!mine) return { total: 0, rows: [] as Awaited<ReturnType<typeof getPhasesForOrder>> };
+
+  const where = {
+    deletedAt: null,
+    inChargeEmployeeId: mine.id,
+    status: { in: ACTIVE_STATUSES },
+  } as const;
+
+  const [total, rows] = await Promise.all([
+    db.misJobPhase.count({ where }),
+    db.misJobPhase.findMany({ where, include: phaseInclude, orderBy: { startedAt: 'asc' }, take: limit }),
+  ]);
+  return { total, rows };
+}
+
+// ---------------------------------------------------------------------------
+// Planning — the phases have to come from somewhere
+// ---------------------------------------------------------------------------
+
+/**
+ * Create the eleven BPR work-flow processes that are missing from the master.
+ *
+ * Idempotent and name-matched: five of the eleven already exist under the
+ * client's own codes, alongside thirteen more processes they use. Re-seeding
+ * all eleven would duplicate real master data (Appendix A §A.1). New rows take
+ * the next free `PROC-0NN`; `PROC-008` is a gap in the live sequence and is
+ * never reused, because a reused code resurrects a ghost.
+ */
+export async function ensureBprProcesses() {
+  await requirePermission('masters.write');
+  const existing = await db.misProcess.findMany({ select: { id: true, name: true, code: true } });
+  const byName = new Map(existing.map((p) => [processNameKey(p.name), p]));
+
+  const used = new Set(existing.map((p) => p.code));
+  let next = 20;
+  const nextCode = () => {
+    let code = `PROC-${String(next).padStart(3, '0')}`;
+    while (used.has(code)) {
+      next += 1;
+      code = `PROC-${String(next).padStart(3, '0')}`;
+    }
+    used.add(code);
+    next += 1;
+    return code;
+  };
+
+  const created: string[] = [];
+  for (const [index, name] of BPR_WORKFLOW.entries()) {
+    if (byName.has(processNameKey(name))) continue;
+    const rec = await db.misProcess.create({
+      data: { code: nextCode(), name, sortOrder: 100 + index },
+    });
+    created.push(rec.name);
+  }
+  return { created, alreadyPresent: BPR_WORKFLOW.length - created.length };
+}
+
+/**
+ * Lay out an order's phases — the planner ticking boxes on the BPR work flow.
+ *
+ * Processes not ticked are written as NOT_APPLICABLE rather than left out, so
+ * the job card shows the whole route and what was skipped, and so restoring one
+ * later is a transition rather than an insert into a numbered sequence.
+ */
+export async function planPhases(
+  orderId: string,
+  selection: { processId: string; applies: boolean; bomStageId?: string | null }[],
+) {
+  const actor = await requirePermission('phase.write');
+  if (actor.role !== 'OWNER' && actor.role !== 'ADMIN') {
+    throw new JobPhaseError(
+      'ILLEGAL_TRANSITION',
+      'Only an admin or the owner can plan a job card.',
+      { role: actor.role },
+    );
+  }
+
+  const refuse = (message: string, detail: Record<string, unknown> = {}) =>
+    new JobPhaseError('ILLEGAL_TRANSITION', message, { orderId, ...detail });
+
+  // R3 B117 - validate the plan before any write.
+  if (!selection.some((e) => e.applies)) throw refuse('Tick at least one process for this job card.');
+  const seen = new Set<string>();
+  for (const e of selection) {
+    const k = `${e.processId}|${e.bomStageId ?? ''}`;
+    if (seen.has(k)) throw refuse('The same process and stage is listed twice.', { processId: e.processId });
+    seen.add(k);
+  }
+  const order = await db.misOrder.findUnique({ where: { id: orderId }, select: { id: true, status: true } });
+  if (!order) throw new JobPhaseError('PHASE_NOT_FOUND', 'That order no longer exists.', { orderId });
+  if (isOrderClosed(order.status)) throw refuse(`This order is ${order.status.toLowerCase()}, so it cannot be planned.`);
+  const processIds = [...new Set(selection.map((e) => e.processId))];
+  const processes = await db.misProcess.findMany({
+    where: { id: { in: processIds }, isActive: true, deletedAt: null },
+    select: { id: true },
+  });
+  if (processes.length !== processIds.length) throw refuse('A selected process does not exist or is inactive.');
+  const stageIds = [...new Set(selection.map((e) => e.bomStageId).filter((x): x is string => Boolean(x)))];
+  if (stageIds.length > 0) {
+    const stages = await db.misBomStage.findMany({
+      where: { id: { in: stageIds }, bom: { orderId } },
+      select: { id: true },
+    });
+    if (stages.length !== stageIds.length) throw refuse("A selected stage is not part of this order's BOM.");
+  }
+
+  const rows = selection.map((entry, index) => ({
+    orderId,
+    processId: entry.processId,
+    bomStageId: entry.bomStageId ?? null,
+    sequence: index + 1,
+    status: (entry.applies ? 'PENDING' : 'NOT_APPLICABLE') as MisJobPhaseStatus,
+    notApplicableReason: entry.applies ? null : 'Not on this job card',
+  }));
+
+  // The count and the insert share one transaction and an advisory lock, so two concurrent
+  // plans cannot both see "nothing planned yet".
+  await db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`plan-phases-${orderId}`}))`;
+    const existing = await tx.misJobPhase.count({ where: { orderId, deletedAt: null } });
+    if (existing > 0) {
+      throw new JobPhaseError(
+        'ILLEGAL_TRANSITION',
+        'This order already has a phase plan. Skip or restore individual phases instead of re-planning it.',
+        { orderId, existing },
+      );
+    }
+    await tx.misJobPhase.createMany({ data: rows });
+  });
+  await logAuditEvent({
+    actorId: actor.userId,
+    action: 'PLAN_PHASES',
+    entity: 'MisOrder',
+    entityId: orderId,
+    after: { phases: rows.length, applicable: rows.filter((r) => r.status === 'PENDING').length },
+  });
+  return getPhasesForOrder(orderId);
+}
+
+// ---------------------------------------------------------------------------
+// The production gate — Appendix A §A.8
+// ---------------------------------------------------------------------------
+
+/**
+ * Which phase a production entry belongs to, resolved on the server.
+ *
+ * Returns null when the order has no phases at all (D10) — that order is
+ * ungated, exactly as it was before this feature existed, and the order screen
+ * says so rather than letting the silence read as a passed gate.
+ *
+ * Resolving here rather than on the screen is what keeps the 2-3 tap entry
+ * screen unchanged and leaves D8's required machineId alone.
+ */
+export async function resolveJobPhaseForProduction(
+  orderId: string,
+  jobPhaseId?: string,
+): Promise<string | null> {
+  if (jobPhaseId) {
+    const named = await db.misJobPhase.findFirst({
+      where: { id: jobPhaseId, orderId, deletedAt: null },
+      include: phaseInclude,
+    });
+    if (!named) {
+      throw new JobPhaseError('PHASE_NOT_FOUND', 'That phase is not on this order.', { orderId, jobPhaseId });
+    }
+    if (!isActiveStatus(named.status)) {
+      throw new JobPhaseError(
+        'NO_ACTIVE_PHASE',
+        `${named.process.name} is ${humanStatus(named.status)}, so production cannot be recorded against it.`,
+        { phaseId: named.id, status: named.status },
+      );
+    }
+    return named.id;
+  }
+
+  const phases = await db.misJobPhase.findMany({
+    where: { orderId, deletedAt: null },
+    include: phaseInclude,
+    orderBy: { sequence: 'asc' },
+  });
+  if (phases.length === 0) return null;
+
+  const active = phases.filter((p) => isActiveStatus(p.status));
+  if (active.length === 1) return active[0].id;
+
+  if (active.length === 0) {
+    const nextUp = phases.find((p) => p.status === 'PENDING');
+    throw new JobPhaseError(
+      'NO_ACTIVE_PHASE',
+      nextUp
+        ? `No phase is running on this order. ${nextUp.process.name} is next — ${describeHolder(nextUp)} needs to start it.`
+        : 'No phase is running on this order, and there is none left to start.',
+      { orderId, nextPhaseId: nextUp?.id ?? null },
+    );
+  }
+
+  throw new JobPhaseError(
+    'AMBIGUOUS_ACTIVE_PHASE',
+    `More than one phase is running on this order (${active.map((p) => p.process.name).join(', ')}). Say which one this entry belongs to.`,
+    { orderId, candidates: active.map((p) => ({ id: p.id, processName: p.process.name })) },
+  );
+}
+
+function appendNote(existing: string | null, addition: string): string {
+  return existing ? `${existing}\n${addition}` : addition;
+}

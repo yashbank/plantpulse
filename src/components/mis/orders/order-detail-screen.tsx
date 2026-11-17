@@ -1,0 +1,442 @@
+'use client';
+import { ArrowLeft } from 'lucide-react';
+import { formatQtyByUnit } from '@/lib/mis/qty-by-unit';
+import { useState, useTransition, type ReactNode } from 'react';
+import Link from 'next/link';
+import { Button } from '@/components/mis/kit/button';
+import { Input } from '@/components/mis/kit/input';
+import { SlideOver } from '@/components/mis/kit/slide-over';
+import { StatusBadge, type BadgeTone } from '@/components/mis/kit/status-badge';
+import { DataTable, type Column } from '@/components/mis/kit/data-table';
+import { addOrderDocumentAction, reopenOrderAction } from '@/app/(mis)/mis/orders/actions';
+import { useToast } from '@/components/ui/toast';
+import { formatOrderQuantity } from '@/lib/mis/order-quantity';
+import { useT } from '@/components/mis/shell/locale-provider';
+import { isOrderClosed } from '@/lib/mis/order-status';
+import { validateDocumentInput } from '@/lib/mis/document-library';
+import { fmtDate, fmtDateTime } from '@/lib/mis/client-dates';
+
+type Order = {
+  id: string; orderNumber: string; status: string; description: string | null; deliveryDate: Date | null; notes: string | null; createdAt: Date; customer: { name: string } | null;
+  /** R2-264 / R2-265 */
+  quantity?: number | string | null; unit?: string | null; customerPoRef?: string | null;
+};
+type Bom = { id: string; status: string; stages: unknown[] } | null;
+type ProductionLog = { id: string; loggedAt: Date; qtyProduced: number; qtyWaste: number; unit: string; machine: { name: string } | null; employee: { name: string } | null; shift: { name: string } | null };
+type QcLog = { id: string; checkTime: Date; result: string; parameterName: string | null; defectType: string | null; notes: string | null; checkBy: { name: string } | null };
+type OrderDocument = { id: string; name: string; description: string | null; filePath: string; createdAt: Date; uploadedByProfile: { name: string | null; email: string } | null };
+
+type Tab = 'overview' | 'bom' | 'production' | 'qc' | 'documents';
+
+type JobPhase = {
+  id: string;
+  sequence: number;
+  status: string;
+  processName: string;
+  inChargeName: string | null;
+  downstreamFlagged: boolean;
+};
+
+type Props = {
+  order: Order;
+  /**
+   * Empty means this order has no phase plan, which is a state the screen
+   * renders rather than a blank (D10). A silent bypass reads as a passed gate.
+   */
+  phases: JobPhase[];
+  bom: Bom;
+  productionLogs: ProductionLog[];
+  productionSummary: { totalProduced: number; totalWaste: number; entries: number; byUnit?: { unit: string; produced: number }[] };
+  qcLogs: QcLog[];
+  qcSummary: { total: number; pass: number; fail: number };
+  /** Includes the customer's PO once attached — a document, not a field (E5-09, S6-Documents.png). */
+  documents: OrderDocument[];
+  /** V2 Epic 2 — stock earmarked for this order by FOR_ORDER deliveries, and what is left to issue. */
+  allocations?: { itemId: string; code: string; name: string; unit: string; allocated: number; issued: number; remaining: number }[];
+  /** Complete / deliver / cancel controls; the page passes them only to roles with orders.write. */
+  statusActions?: ReactNode;
+  canWrite: boolean;
+  canSeeWages: boolean;
+  canProduction: boolean;
+  canQc: boolean;
+  /** False for a role without phase.read: the Phases card is left out, not shown as "No phase plan". */
+  showPhases?: boolean;
+};
+
+/** REOPENED reads as a warning, not as signed — it is not a signature (Appendix A §A.2). */
+function phaseTone(s: string): BadgeTone {
+  switch (s) {
+    case 'SIGNED_OFF': return 'good';
+    case 'IN_PROGRESS': return 'info';
+    case 'REOPENED': return 'warning';
+    case 'NOT_APPLICABLE': return 'neutral';
+    default: return 'neutral';
+  }
+}
+
+function statusTone(s: string): BadgeTone {
+  switch (s) {
+    case 'CONFIRMED': return 'info';
+    case 'IN_PRODUCTION': return 'warning';
+    case 'COMPLETED': return 'good';
+    case 'DELIVERED': return 'good';
+    case 'CANCELLED': return 'critical';
+    default: return 'neutral';
+  }
+}
+
+export function OrderDetailScreen({
+  order, phases, bom, productionLogs, productionSummary, qcLogs, qcSummary, documents, allocations = [],
+  statusActions, canWrite, canSeeWages: _canSeeWages, canProduction, canQc, showPhases = true,
+}: Props) {
+  const [tab, setTab] = useState<Tab>('overview');
+  const t = useT();
+  const [reopenOpen, setReopenOpen] = useState(false);
+  const [reopenReason, setReopenReason] = useState('');
+  const [reopenError, setReopenError] = useState<string | null>(null);
+  const [reopenWarning, setReopenWarning] = useState<string | null>(null); // R2-266
+  const [reopening, startReopen] = useTransition();
+  const closed = isOrderClosed(order.status);
+
+  const [docOpen, setDocOpen] = useState(false);
+  const [docName, setDocName] = useState('');
+  const [docDesc, setDocDesc] = useState('');
+  const [docPath, setDocPath] = useState('');
+  const [docError, setDocError] = useState<string | null>(null);
+  const [docPending, startDoc] = useTransition();
+  const { toast } = useToast();
+
+  const handleAddDocument = () => {
+    const message = validateDocumentInput({ orderId: order.id, name: docName, description: docDesc, link: docPath });
+    if (message) { setDocError(message); return; }
+    setDocError(null);
+    startDoc(async () => {
+      const res = await addOrderDocumentAction(order.id, { name: docName.trim(), description: docDesc.trim() || undefined, filePath: docPath.trim() });
+      if (!res.ok) { setDocError(res.detail); toast('error', res.detail); return; }
+      setDocName(''); setDocDesc(''); setDocPath(''); setDocOpen(false);
+    });
+  };
+
+  const handleReopen = () => startReopen(async () => {
+    setReopenError(null);
+    const result = await reopenOrderAction(order.id, reopenReason);
+    if (result.ok) {
+      setReopenOpen(false);
+      setReopenReason('');
+      if (result.warning) { setReopenWarning(result.warning); toast('info', result.warning); }
+    } else {
+      setReopenError(result.detail);
+    }
+  });
+
+  const tabs: { key: Tab; label: string; show: boolean }[] = [
+    { key: 'overview', label: 'Overview', show: true },
+    { key: 'bom', label: 'BOM', show: true },
+    { key: 'production', label: 'Production', show: canProduction },
+    { key: 'qc', label: 'Quality', show: canQc },
+    { key: 'documents', label: `Documents${documents.length ? ` (${documents.length})` : ''}`, show: true },
+  ];
+
+  const prodCols: Column<ProductionLog>[] = [
+    { key: 'loggedAt', header: 'Date', render: r => fmtDate(r.loggedAt) },
+    { key: 'employee', header: 'Employee', render: r => r.employee?.name ?? '—' },
+    { key: 'machine', header: 'Machine', render: r => r.machine?.name ?? '—' },
+    { key: 'shift', header: 'Shift', render: r => r.shift?.name ?? '—' },
+    { key: 'produced', header: 'Produced', render: r => `${Number(r.qtyProduced).toLocaleString('en-IN')} ${r.unit}` },
+    { key: 'waste', header: 'Waste', render: r => `${Number(r.qtyWaste).toLocaleString('en-IN')} ${r.unit}` },
+  ];
+
+  const qcCols: Column<QcLog>[] = [
+    { key: 'checkTime', header: 'Date', render: r => fmtDate(r.checkTime) },
+    { key: 'parameter', header: 'Parameter', render: r => r.parameterName ?? 'General' },
+    { key: 'result', header: 'Result', render: r => (
+      <StatusBadge tone={r.result === 'PASS' ? 'good' : r.result === 'FAIL' ? 'critical' : 'neutral'}>{r.result}</StatusBadge>
+    )},
+    { key: 'defect', header: 'Defect / Note', render: r => r.defectType ?? r.notes ?? '—' },
+    { key: 'checkedBy', header: 'Checked By', render: r => r.checkBy?.name ?? '—' },
+  ];
+
+  return (
+    <div className="p-6 max-w-5xl mx-auto">
+      {/* Heading keeps a named text colour: heading-text-color.test.ts reads this source. */}
+      <header className="mb-3 flex flex-col gap-1">
+        <div className="flex items-center gap-2">
+          <Link href="/mis/orders" aria-label="Orders" className="mis-press -ml-2 flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-xl text-slate-600 hover:bg-slate-100">
+            <ArrowLeft aria-hidden="true" className="size-5" />
+          </Link>
+          <h1 className="min-w-0 flex-1 break-words font-mono text-2xl font-semibold tracking-tight text-slate-900">{order.orderNumber}</h1>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-600">
+          <StatusBadge dot tone={statusTone(order.status)}>{order.status.replace(/_/g, ' ')}</StatusBadge>
+          {order.description && <span>{order.description}</span>}
+        </div>
+      </header>
+
+      {/* Header */}
+      <div className="flex items-start justify-between mb-6 gap-4 flex-wrap">
+        <div>
+          {/* D14: a closed order refuses production. Say so here, beside the way
+              through it — a refusal with no route is a dead end, and a dead end is
+              what sends somebody to edit the database by hand. */}
+          {closed && <p className="mt-1 text-sm text-amber-800">{t('order.reopen.closedNote')}</p>}
+          {reopenWarning && <p role="status" className="mt-1 rounded-lg bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-900">{reopenWarning}</p>}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {statusActions}
+          {closed && canWrite && (
+            <button
+              type="button"
+              onClick={() => setReopenOpen(true)}
+              className="mis-press inline-flex min-h-12 touch-manipulation items-center rounded-xl border border-amber-300 bg-white px-3 text-sm font-semibold text-amber-900 hover:bg-amber-50"
+            >
+              {t('order.reopen')}
+            </button>
+          )}
+          <Link href={`/mis/print/job-card/${order.id}`} target="_blank" className="mis-press inline-flex min-h-11 touch-manipulation items-center rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50">
+            Print Job Card
+          </Link>
+          {qcSummary.pass > 0 && (
+            <Link href={`/mis/print/coa/${order.id}`} target="_blank" className="mis-press inline-flex min-h-11 touch-manipulation items-center rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50">
+              Print COA
+            </Link>
+          )}
+        </div>
+      </div>
+
+      {/* Phases — the handover gate, or an honest statement that there is none (D10) */}
+      {showPhases && <div className="mb-6 rounded-xl border border-slate-200 bg-white p-4">
+        <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Phases</p>
+        {phases.length === 0 ? (
+          <>
+            <p className="mt-1 font-semibold text-slate-900">No phase plan · not gated</p>
+            <p className="mt-0.5 text-sm text-slate-500">
+              This order has no phase plan, so nothing is blocking production on it.
+            </p>
+          </>
+        ) : (
+          <ul className="mt-2 divide-y divide-slate-100">
+            {phases.map((phase) => (
+              <li key={phase.id} className="flex items-center justify-between gap-3 py-2">
+                <span className="min-w-0">
+                  <span className="block truncate font-medium text-slate-900">
+                    <span className="font-mono text-xs text-slate-400">{phase.sequence}.</span>{' '}
+                    {phase.processName}
+                  </span>
+                  <span className="block truncate text-xs text-slate-500">
+                    {phase.inChargeName ?? 'No in-charge yet'}
+                    {phase.downstreamFlagged && ' · an earlier phase was reopened after this one started'}
+                  </span>
+                </span>
+                <span className="flex shrink-0 items-center gap-2">
+                  <StatusBadge dot tone={phaseTone(phase.status)}>
+                    {phase.status.replace(/_/g, ' ')}
+                  </StatusBadge>
+                  {(phase.status === 'IN_PROGRESS' || phase.status === 'REOPENED') && (
+                    <Link
+                      href={`/mis/production/sign-off/${phase.id}`}
+                      className="mis-press inline-flex min-h-11 touch-manipulation items-center rounded-lg px-2 text-sm font-semibold text-indigo-700"
+                    >
+                      Sign off
+                    </Link>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>}
+
+      {/* Quick stats */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+        <div className="bg-slate-50 rounded-lg p-3">
+          <p className="text-xs text-slate-500">Customer</p>
+          <p className="font-medium mt-0.5">{order.customer?.name ?? '—'}</p>
+        </div>
+        <div className="bg-slate-50 rounded-lg p-3">
+          <p className="text-xs text-slate-500">Delivery Date</p>
+          <p className="font-medium mt-0.5">{order.deliveryDate ? fmtDate(order.deliveryDate) : '—'}</p>
+        </div>
+        <div className="bg-slate-50 rounded-lg p-3">
+          <p className="text-xs text-slate-500">Ordered</p>
+          <p className="font-medium mt-0.5">{formatOrderQuantity(order.quantity, order.unit) ?? '—'}</p>
+        </div>
+        <div className="bg-slate-50 rounded-lg p-3">
+          <p className="text-xs text-slate-500">Customer PO #</p>
+          <p className="font-medium mt-0.5 font-mono">{order.customerPoRef ?? '—'}</p>
+        </div>
+        <div className="bg-slate-50 rounded-lg p-3">
+          <p className="text-xs text-slate-500">Produced</p>
+          <p className="font-medium mt-0.5">{formatQtyByUnit((productionSummary.byUnit ?? []).map((u) => ({ unit: u.unit, qty: u.produced })))}</p>
+        </div>
+        <div className="bg-slate-50 rounded-lg p-3">
+          <p className="text-xs text-slate-500">QC Pass Rate</p>
+          <p className="font-medium mt-0.5">
+            {qcSummary.total === 0 ? '—' : `${((qcSummary.pass / qcSummary.total) * 100).toFixed(0)}%`}
+          </p>
+        </div>
+      </div>
+
+      {/* Tab bar. `overflow-x-auto`: five tabs, and "Documents (N)" (E5-09) grows with the
+          count — doesn't fit a 390px phone screen; scrolls inside its own row instead of
+          blowing out the page width. */}
+      <div className="flex gap-1 mb-6 overflow-x-auto scrollbar-none border-b border-slate-200">
+        {tabs.filter(t => t.show).map(t => (
+          <button
+            key={t.key}
+            onClick={() => setTab(t.key)}
+            className={`inline-flex min-h-11 shrink-0 items-center whitespace-nowrap px-4 text-sm font-medium border-b-2 transition-colors ${
+              tab === t.key ? 'border-indigo-600 text-indigo-700' : 'border-transparent text-slate-500 hover:text-slate-700'
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'overview' && (
+        <div className="space-y-4">
+          {order.notes && (
+            <div>
+              <h3 className="text-sm font-medium text-slate-700 mb-1">Notes</h3>
+              <p className="text-slate-600 bg-slate-50 rounded p-3">{order.notes}</p>
+            </div>
+          )}
+          <div>
+            <h3 className="text-sm font-medium text-slate-700 mb-1">Created</h3>
+            <p className="text-slate-600">{fmtDateTime(order.createdAt)}</p>
+          </div>
+        </div>
+      )}
+
+      {tab === 'bom' && (
+        <div>
+          {bom ? (
+            <div>
+              <div className="flex items-center gap-3 mb-4">
+                <StatusBadge tone={bom.status === 'APPROVED' ? 'good' : bom.status === 'PENDING_APPROVAL' ? 'warning' : 'neutral'}>
+                  {bom.status}
+                </StatusBadge>
+                <Link href={`/mis/bom/${order.id}`} className="inline-flex min-h-11 items-center text-sm font-medium text-indigo-700 hover:underline">
+                  Open full BOM →
+                </Link>
+              </div>
+              <p className="text-slate-500 text-sm">{bom.stages.length} stages defined</p>
+            </div>
+          ) : (
+            <div className="text-center py-12">
+              <p className="text-slate-500 mb-3">No BOM yet for this order.</p>
+              <Link href={`/mis/bom/${order.id}`} className="inline-flex min-h-11 items-center text-sm font-medium text-indigo-700 hover:underline">
+                Create BOM →
+              </Link>
+            </div>
+          )}
+          {allocations.length > 0 && (
+            <div className="mt-6">
+              <h3 className="text-sm font-medium text-slate-700 mb-2">Stock allocated to this order</h3>
+              <ul className="divide-y divide-slate-200 rounded-lg border border-slate-200">
+                {allocations.map((a) => (
+                  <li key={a.itemId} className="flex items-center justify-between gap-3 px-3 py-2.5 text-sm">
+                    <span className="min-w-0">
+                      <span className="block truncate font-medium text-slate-800">{a.name}</span>
+                      <span className="block text-xs text-slate-500">{a.code}</span>
+                    </span>
+                    <span className="shrink-0 text-right text-slate-600">
+                      <span className="block"><strong className={a.remaining <= 0 ? 'text-red-600' : 'text-slate-900'}>{a.remaining}</strong> {a.unit} left</span>
+                      <span className="block text-xs">{a.issued} issued of {a.allocated}</span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === 'production' && (
+        <DataTable
+          columns={prodCols}
+          rows={productionLogs}
+          rowKey={r => r.id}
+          emptyTitle="No production logged"
+          emptyBody="No production entries have been logged for this order yet."
+        />
+      )}
+
+      {tab === 'qc' && (
+        <DataTable
+          columns={qcCols}
+          rows={qcLogs}
+          rowKey={r => r.id}
+          emptyTitle="No QC checks"
+          emptyBody="No quality checks have been recorded for this order yet."
+        />
+      )}
+
+      {tab === 'documents' && (
+        <div>
+          <div className="flex items-center justify-between mb-4">
+            <p className="text-sm text-slate-500">
+              The customer&rsquo;s PO and anything else sent or generated for this order — a name and a link, kept here, never overwritten.
+            </p>
+            {canWrite && <Button onClick={() => setDocOpen(true)}>+ Add document</Button>}
+          </div>
+          {documents.length === 0 ? (
+            <div className="text-center py-12">
+              <p className="text-slate-500 mb-1">No documents yet.</p>
+              <p className="text-slate-400 text-sm">Attach the customer&rsquo;s PO, artwork approval or any other file.</p>
+            </div>
+          ) : (
+            <ul className="divide-y divide-slate-100 rounded-xl border border-slate-200 bg-white">
+              {documents.map((doc) => (
+                <li key={doc.id} className="flex items-center justify-between gap-3 px-4 py-3">
+                  <div className="min-w-0">
+                    <p className="truncate font-medium text-slate-900">{doc.name}</p>
+                    <p className="truncate text-xs text-slate-500">
+                      {fmtDate(doc.createdAt)}
+                      {doc.uploadedByProfile?.name ? ` · ${doc.uploadedByProfile.name}` : ''}
+                      {doc.description ? ` · ${doc.description}` : ''}
+                    </p>
+                  </div>
+                  <a href={doc.filePath} target="_blank" rel="noopener noreferrer" className="inline-flex min-h-11 shrink-0 items-center text-sm font-medium text-indigo-700 hover:underline">
+                    Open
+                  </a>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <SlideOver open={docOpen} onClose={() => { setDocOpen(false); setDocError(null); }} title="Add document">
+        <div className="flex flex-col gap-4 p-4">
+          <Input label="Name" value={docName} onChange={e => setDocName(e.target.value)} placeholder="e.g. Customer PO" />
+          <Input label="Description (optional)" value={docDesc} onChange={e => setDocDesc(e.target.value)} />
+          <Input label="File link" value={docPath} onChange={e => setDocPath(e.target.value)} placeholder="https://..." />
+          {docError && (
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm font-semibold text-amber-900">{docError}</div>
+          )}
+          <div className="flex gap-2 pt-2">
+            <Button onClick={handleAddDocument} disabled={docPending}>{docPending ? 'Saving…' : 'Add'}</Button>
+            <Button variant="ghost" onClick={() => { setDocOpen(false); setDocError(null); }}>Cancel</Button>
+          </div>
+        </div>
+      </SlideOver>
+
+      <SlideOver open={reopenOpen} onClose={() => { setReopenOpen(false); setReopenError(null); }} title={t('order.reopen')}>
+        <div className="flex flex-col gap-4 p-4">
+          <p className="text-sm text-slate-600">
+            {order.orderNumber} · {order.status.replace(/_/g, ' ')}
+          </p>
+          <Input label={t('order.reopen.why')} value={reopenReason} onChange={(e) => setReopenReason(e.target.value)} />
+          {reopenError && (
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm font-semibold text-amber-900">{reopenError}</div>
+          )}
+          <div className="flex gap-2 pt-2">
+            <Button onClick={handleReopen} disabled={reopening || !reopenReason.trim()}>{t('order.reopen.confirm')}</Button>
+            <Button variant="ghost" onClick={() => { setReopenOpen(false); setReopenError(null); }}>{t('action.cancel')}</Button>
+          </div>
+        </div>
+      </SlideOver>
+    </div>
+  );
+}

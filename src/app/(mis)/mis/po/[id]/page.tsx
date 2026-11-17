@@ -1,0 +1,49 @@
+import { isUuid } from '@/lib/mis/ids';
+import { toPlain } from '@/lib/mis/plain';
+import { notFound } from 'next/navigation';
+import { requireMisAccess } from '@/server/mis/guard';
+import { checkPermission } from '@/server/mis/auth';
+import { getPO, computePoTotal, formatMoney, listApprovedBomOrders } from '@/server/mis/po';
+import { listItems } from '@/server/mis/item';
+import { listSuppliers } from '@/server/mis/supplier';
+import { reconcilePO } from '@/server/mis/supplier-invoice';
+import { PoDetailScreen } from '@/components/mis/po/po-detail-screen';
+
+export default async function PoDetailPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  if (!isUuid(id)) notFound();
+  await requireMisAccess();
+  const po = await getPO(id);
+  if (!po) notFound();
+  // Rates and totals are money (D24, F-06): only `wages.read` receives them. For anyone else `getPO`
+  // has already removed the rate, and the total is neither computed nor sent.
+  const [canSeeMoney, canWrite, canApprove, canReconcile] = await Promise.all([
+    checkPermission('wages.read'),
+    checkPermission('po.write'),
+    checkPermission('po.write'),
+    checkPermission('po.read'), // R2-37: QC views the PO (po.view) but not the 3-way match
+  ]);
+  // The item catalog only feeds the "Add Item" form, which is itself gated on canWrite — a
+  // po.read-only viewer (e.g. STORE_GUY, who lacks masters.read) must never reach listItems().
+  const items = canWrite ? await listItems() : [];
+  // The header editor (DRAFT only) needs the supplier list and the approved-BOM picker.
+  const [suppliers, approvedBoms] = canWrite && po.status === 'DRAFT' ? await Promise.all([listSuppliers(), listApprovedBomOrders()]) : [[], []];
+  const total = canSeeMoney ? await computePoTotal(id) : null;
+  const reconciliation = canReconcile && (po.grns?.length ?? 0) > 0 ? await reconcilePO(id) : null;
+  type PoItem = (typeof po.items)[number];
+  const formattedItems = po.items.map((item: PoItem) => ({
+    id: item.id,
+    description: item.description,
+    item: item.item,
+    quantity: item.quantity.toNumber(),
+    receivedQuantity: item.receivedQuantity.toNumber(),
+    ...(canSeeMoney && item.ratePerUnit
+      ? {
+          ratePerUnit: item.ratePerUnit.toNumber(),
+          rateFormatted: formatMoney(item.ratePerUnit),
+          totalFormatted: formatMoney(item.quantity.toNumber() * item.ratePerUnit.toNumber()),
+        }
+      : {}),
+  }));
+  return <PoDetailScreen po={toPlain(po)} formattedItems={formattedItems} total={total} catalogItems={toPlain(items)} canWrite={canWrite} canApprove={canApprove} reconciliation={reconciliation} suppliers={suppliers.map((s) => ({ id: s.id, name: s.name }))} approvedBoms={approvedBoms} />;
+}

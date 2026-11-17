@@ -1,0 +1,271 @@
+'use client';
+import { PageHeader } from '@/components/mis/kit/page-header';
+import { useState, useTransition } from 'react';
+import { Select } from '@/components/mis/kit/select';
+import { StatusBadge, type BadgeTone } from '@/components/mis/kit/status-badge';
+import { fmtDate } from '@/lib/mis/client-dates';
+import { safeHref } from '@/lib/mis/document-library';
+
+type Order = { id: string; orderNumber: string; description: string | null; status: string };
+
+// Shape of the JSON body returned by `GET /api/mis/trace/[orderId]` (`getOrderTrace`,
+// server/mis/traceability.ts). Dates and Decimals cross the wire as strings, hence the
+// `new Date(...)`/`Number(...)` conversions below rather than using them directly.
+type TraceOrder = {
+  orderNumber: string;
+  status: string;
+  deliveryDate: string | null;
+  customer: { name: string } | null;
+};
+type TraceBomMaterial = { id: string };
+type TraceBomStage = { id: string; stageName: string; materials: TraceBomMaterial[] | null };
+type TraceBom = { stages: TraceBomStage[] | null } | null;
+type TraceProductionLog = {
+  id: string;
+  loggedAt: string;
+  qtyProduced: number | string;
+  unit: string;
+  employee: { name: string } | null;
+  machine: { name: string } | null;
+};
+type TraceQcCheck = {
+  id: string;
+  checkTime: string;
+  parameterName: string | null;
+  result: string;
+  checkBy: { name: string } | null;
+};
+type TraceDocument = { id: string; name: string; filePath: string };
+// null = this role may not see the leg (no po.read / store.read); [] = may see it, nothing behind it.
+type TraceGrn = { grnNumber: string; status: string; receivedAt: string | null; lines: { itemName: string; unit: string | null; receivedQty: number; batchNo?: string | null }[] };
+type TracePo = { poNumber: string; status: string; supplierName: string | null; grns: TraceGrn[] | null };
+type TraceIssued = { itemName: string; unit: string; qty: number; issuedAt: string };
+type TraceResult = {
+  purchaseOrders: TracePo[] | null;
+  issuedMaterials: TraceIssued[] | null;
+  order: TraceOrder | null;
+  bom: TraceBom;
+  productionLogs: TraceProductionLog[];
+  qcChecks: TraceQcCheck[];
+  documents: TraceDocument[];
+  /** R2-290: null when the logs mix units; `byUnit` always has every unit. */
+  totalProduced: number | null;
+  totalWaste: number | null;
+  byUnit: { unit: string; produced: number; waste: number }[];
+  passChecks: number;
+  failChecks: number;
+};
+
+function statusTone(s: string): BadgeTone {
+  switch (s) {
+    case 'CONFIRMED': return 'info';
+    case 'IN_PRODUCTION': return 'warning';
+    case 'COMPLETE': return 'good';
+    case 'CANCELLED': return 'critical';
+    default: return 'neutral';
+  }
+}
+
+export function TraceabilityScreen({ orders }: { orders: Order[] }) {
+  const [selectedOrderId, setSelectedOrderId] = useState('');
+  const [trace, setTrace] = useState<TraceResult | null>(null);
+  const [isPending, startTransition] = useTransition();
+  const [error, setError] = useState('');
+
+  const handleSelect = (orderId: string) => {
+    setSelectedOrderId(orderId);
+    if (!orderId) { setTrace(null); return; }
+    setError('');
+    startTransition(async () => {
+      try {
+        const res = await fetch(`/api/mis/trace/${orderId}`);
+        if (!res.ok) throw new Error('Failed to load');
+        const data = await res.json();
+        setTrace(data);
+      } catch {
+        setError('Could not load trace data.');
+      }
+    });
+  };
+
+  const orderOptions = [
+    { value: '', label: '— Select Order —' },
+    ...orders.map(o => ({ value: o.id, label: `${o.orderNumber}${o.description ? ` — ${o.description}` : ''}` })),
+  ];
+
+  // R2-290: one unit only; a mixed-unit order has no single yield figure.
+  const yieldPct = trace && trace.totalProduced != null && trace.totalWaste != null && trace.totalProduced > 0
+    ? (((trace.totalProduced - trace.totalWaste) / trace.totalProduced) * 100).toFixed(1)
+    : null;
+  const producedLabel = trace && trace.byUnit.length > 0
+    ? trace.byUnit.map((u) => `${u.produced.toLocaleString('en-IN')} ${u.unit}`).join(' · ')
+    : '—';
+
+  return (
+    <div className="mx-auto max-w-4xl p-4 sm:p-6">
+      <PageHeader title="Traceability" />
+
+      <div className="max-w-sm mb-6">
+        <Select label="Select Order" value={selectedOrderId} onChange={handleSelect} options={orderOptions} />
+      </div>
+
+      {isPending && <p role="status" className="text-slate-500">Loading trace…</p>}
+      {error && <p className="text-red-600">{error}</p>}
+
+      {trace && trace.order && (
+        <div className="space-y-6">
+          {/* Order header */}
+          <div className="mis-rise rounded-2xl border border-slate-200 bg-white p-5 shadow-card">
+            <div className="flex items-center gap-3 mb-3 flex-wrap">
+              <h2 className="text-xl font-bold font-mono">{trace.order.orderNumber}</h2>
+              <StatusBadge dot tone={statusTone(trace.order.status)}>{trace.order.status.replace(/_/g, ' ')}</StatusBadge>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+              <div><span className="text-slate-500">Customer</span><p className="font-medium">{trace.order.customer?.name ?? '—'}</p></div>
+              <div><span className="text-slate-500">Delivery</span><p className="font-medium">{trace.order.deliveryDate ? new Date(trace.order.deliveryDate).toLocaleDateString('en-IN') : '—'}</p></div>
+              <div><span className="text-slate-500">Produced</span><p className="font-medium">{producedLabel}</p></div>
+              <div><span className="text-slate-500">Yield</span><p className="font-medium">{yieldPct ? `${yieldPct}%` : '—'}</p></div>
+            </div>
+          </div>
+
+          {/* BOM */}
+          <Section title="Bill of Materials" count={trace.bom?.stages?.length ?? 0}>
+            {trace.bom ? (
+              <div className="space-y-3">
+                {trace.bom.stages?.map((stage, i) => (
+                  <div key={stage.id} className="flex gap-3 items-start">
+                    <span className="bg-slate-200 text-slate-700 text-xs font-bold rounded-full w-6 h-6 flex items-center justify-center flex-shrink-0 mt-0.5">{i + 1}</span>
+                    <div>
+                      <p className="font-medium text-sm">{stage.stageName}</p>
+                      {(stage.materials?.length ?? 0) > 0 && (
+                        <p className="text-xs text-slate-500 mt-0.5">{stage.materials?.length} material(s)</p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="text-slate-500 text-sm">No BOM found.</p>}
+          </Section>
+
+          {/* Purchase orders + goods received (absent for roles without po.read) */}
+          {trace.purchaseOrders && (
+            <Section title="Purchase Orders & GRNs" count={trace.purchaseOrders.length}>
+              {trace.purchaseOrders.length > 0 ? (
+                <div className="space-y-4">
+                  {trace.purchaseOrders.map((po) => (
+                    <div key={po.poNumber} className="text-sm">
+                      <p className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono font-semibold">{po.poNumber}</span>
+                        <StatusBadge tone="neutral">{po.status.replace(/_/g, ' ')}</StatusBadge>
+                        <span className="text-slate-500">{po.supplierName ?? 'No supplier'}</span>
+                      </p>
+                      {po.grns && (po.grns.length > 0 ? (
+                        <ul className="mt-2 space-y-2 border-l border-slate-200 pl-3">
+                          {po.grns.map((g) => (
+                            <li key={g.grnNumber}>
+                              <p className="flex flex-wrap items-center gap-2">
+                                <span className="font-mono">{g.grnNumber}</span>
+                                <StatusBadge tone={g.status === 'CONFIRMED' ? 'good' : 'neutral'}>{g.status}</StatusBadge>
+                                <span className="text-slate-500">{g.receivedAt ? fmtDate(g.receivedAt) : 'not received'}</span>
+                              </p>
+                              <ul className="mt-1 text-slate-600">
+                                {g.lines.map((l, i) => <li key={i}>{l.itemName}: {Number(l.receivedQty).toLocaleString('en-IN')} {l.unit ?? ''}{l.batchNo ? <span className="ml-1 font-mono text-xs text-slate-500">· Lot {l.batchNo}</span> : null}</li>)}
+                              </ul>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : <p className="mt-1 text-xs text-slate-500">No goods received against this PO yet.</p>)}
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="text-slate-500 text-sm">No purchase order raised against this order.</p>}
+            </Section>
+          )}
+
+          {/* Material issued to this order (absent for roles without store.read) */}
+          {trace.issuedMaterials && (
+            <Section title="Material issued" count={trace.issuedMaterials.length}>
+              {trace.issuedMaterials.length > 0 ? (
+                <div className="space-y-2">
+                  {trace.issuedMaterials.map((m, i) => (
+                    <div key={i} className="flex items-center gap-4 text-sm border-b border-slate-100 pb-2">
+                      <span className="text-slate-500 w-24 flex-shrink-0">{fmtDate(m.issuedAt)}</span>
+                      <span className="font-medium">{m.itemName}</span>
+                      <span className="text-slate-600">{Number(m.qty).toLocaleString('en-IN')} {m.unit}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="text-slate-500 text-sm">No material issued to this order.</p>}
+            </Section>
+          )}
+
+          {/* Production */}
+          <Section title="Production Log" count={trace.productionLogs.length}>
+            {trace.productionLogs.length > 0 ? (
+              <div className="space-y-2">
+                {trace.productionLogs.map((log) => (
+                  <div key={log.id} className="flex items-center gap-4 text-sm border-b border-slate-100 pb-2">
+                    <span className="text-slate-500 w-24 flex-shrink-0">{new Date(log.loggedAt).toLocaleDateString('en-IN')}</span>
+                    <span className="font-medium">{Number(log.qtyProduced).toLocaleString('en-IN')} {log.unit}</span>
+                    <span className="text-slate-500">{log.employee?.name ?? '—'}</span>
+                    <span className="text-slate-500">{log.machine?.name ?? '—'}</span>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="text-slate-500 text-sm">No production logged.</p>}
+          </Section>
+
+          {/* QC */}
+          <Section title="Quality Checks" count={trace.qcChecks.length}>
+            {trace.qcChecks.length > 0 ? (
+              <div className="space-y-2">
+                {trace.qcChecks.map((check) => (
+                  <div key={check.id} className="flex items-center gap-4 text-sm border-b border-slate-100 pb-2">
+                    <span className="text-slate-500 w-24 flex-shrink-0">{new Date(check.checkTime).toLocaleDateString('en-IN')}</span>
+                    <span className="font-medium">{check.parameterName}</span>
+                    <StatusBadge tone={check.result === 'PASS' ? 'good' : check.result === 'FAIL' ? 'critical' : 'neutral'}>{check.result}</StatusBadge>
+                    <span className="text-slate-500">{check.checkBy?.name ?? '—'}</span>
+                  </div>
+                ))}
+                <div className="flex gap-4 text-sm pt-2">
+                  <span className="text-green-700 font-medium">✓ {trace.passChecks} Pass</span>
+                  {trace.failChecks > 0 && <span className="text-red-700 font-medium">✗ {trace.failChecks} Fail</span>}
+                </div>
+              </div>
+            ) : <p className="text-slate-500 text-sm">No QC checks recorded.</p>}
+          </Section>
+
+          {/* Documents */}
+          <Section title="Documents" count={trace.documents.length}>
+            {trace.documents.length > 0 ? (
+              <div className="space-y-2">
+                {trace.documents.map((doc) => (
+                  <div key={doc.id} className="flex items-center gap-3 text-sm">
+                    <span className="font-medium">{doc.name}</span>
+                    {safeHref(doc.filePath) ? (
+                      <a href={safeHref(doc.filePath) ?? undefined} target="_blank" rel="noopener" className="mis-press inline-flex min-h-11 touch-manipulation items-center text-sm text-blue-700 hover:underline">Download</a>
+                    ) : (
+                      <span className="text-slate-500 text-xs">{doc.filePath}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : <p className="text-slate-500 text-sm">No documents attached.</p>}
+          </Section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Section({ title, count, children }: { title: string; count: number; children: React.ReactNode }) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-card">
+      <div className="flex items-center gap-2 mb-4">
+        <h3 className="font-semibold text-slate-800">{title}</h3>
+        <span className="bg-slate-100 text-slate-600 text-xs rounded-full px-2 py-0.5">{count}</span>
+      </div>
+      {children}
+    </div>
+  );
+}

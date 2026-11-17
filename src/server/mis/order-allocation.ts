@@ -1,0 +1,203 @@
+import type { Prisma } from '@/generated/prisma/client';
+import { foldAllocationFigures, issueRefusal, orderNumberFromRef, remainingAllocation, type AllocationFigures } from '@/lib/mis/order-allocation';
+import { db } from '@/server/db';
+
+import { requirePermission } from './auth';
+
+/**
+ * V2 Epic 2 — earmarking received stock for an order, and reading the earmark back.
+ *
+ * The two writers (`grn.ts#confirmGRN`, `store.ts#commitReceipt`) call `allocateFromReceipt`
+ * inside their own transaction; `commitIssue` calls `allocationFigures` inside its. Neither is a
+ * door: both run only after the caller's gate, on the caller's `tx`.
+ */
+
+type Tx = Prisma.TransactionClient;
+
+/** Earmark `qty` of `itemId` for the order that `ref` names. Returns the order id, or null when `ref` is not an order number or names no order. */
+export async function allocateFromReceipt(
+  tx: Tx,
+  input: { ref: string | null | undefined; itemId: string; qty: number; sourceId: string },
+): Promise<string | null> {
+  const orderNumber = orderNumberFromRef(input.ref);
+  if (!orderNumber || input.qty <= 0) return null;
+  const order = await tx.misOrder.findFirst({ where: { orderNumber }, select: { id: true } });
+  if (!order) return null;
+  await tx.misOrderStockAllocation.create({
+    data: { orderId: order.id, itemId: input.itemId, allocatedQty: input.qty, source: 'GRN', sourceId: input.sourceId },
+  });
+  return order.id;
+}
+
+/** Allocated and already-issued totals per item for one order. Items with no allocation are absent. */
+/**
+ * R2-285: ACCEPTED returns to the store against an order give the earmark back. Folded as issue rows with a
+ * POSITIVE changeQty, so `foldAllocationFigures` nets them off what was issued. Optional call: narrow
+ * hand-built test doubles carry no return delegate; a real client always does.
+ */
+type ReturnReader = { misStoreReturn?: { findMany: (args: { where: object; select: object }) => Promise<{ orderId: string | null; itemId: string; quantity: { toNumber(): number } | number; createdAt: Date }[]> } };
+async function acceptedReturns(tx: object, where: { orderId: string | { in: string[] }; itemId: { in: string[] } }) {
+  const delegate = (tx as ReturnReader).misStoreReturn;
+  const rows = (typeof delegate?.findMany === 'function' ? await delegate.findMany({
+    where: { status: 'ACCEPTED', orderId: where.orderId, itemId: where.itemId },
+    select: { orderId: true, itemId: true, quantity: true, createdAt: true },
+  }) : null) ?? [];
+  return rows.map((r) => ({ orderId: r.orderId ?? '', itemId: r.itemId, changeQty: Number(typeof r.quantity === 'object' ? r.quantity.toNumber() : r.quantity), createdAt: r.createdAt }));
+}
+
+export async function allocationFigures(tx: Tx, orderId: string, itemIds: string[]): Promise<Map<string, AllocationFigures>> {
+  const [allocations, issues, returns] = await Promise.all([
+    tx.misOrderStockAllocation.findMany({ where: { orderId, itemId: { in: itemIds } }, select: { itemId: true, allocatedQty: true, createdAt: true } }),
+    tx.misInventoryLedger.findMany({
+      where: { source: 'STORE_ISSUE', sourceId: orderId, itemId: { in: itemIds } },
+      select: { itemId: true, changeQty: true, createdAt: true },
+    }),
+    acceptedReturns(tx, { orderId, itemId: { in: itemIds } }),
+  ]);
+  return foldAllocationFigures(
+    allocations.map((a) => ({ itemId: a.itemId, allocatedQty: a.allocatedQty.toNumber(), createdAt: a.createdAt })),
+    [...issues.map((i) => ({ itemId: i.itemId, changeQty: i.changeQty.toNumber(), createdAt: i.createdAt })), ...returns],
+    { allocation: (a) => a.itemId, issue: (i) => i.itemId },
+  );
+}
+
+/** The refusal messages for a cart against an order — empty when every line fits its allocation. */
+export async function allocationShortfalls(
+  tx: Tx,
+  orderId: string,
+  lines: { itemId: string; qty: number; label: string }[],
+): Promise<string[]> {
+  const figures = await allocationFigures(tx, orderId, lines.map((l) => l.itemId));
+  return lines
+    .map((l) => issueRefusal(figures.get(l.itemId) ?? { allocated: 0, issued: 0 }, l.qty, l.label))
+    .filter((m): m is string => m !== null);
+}
+
+export type OrderAllocationRow = {
+  itemId: string;
+  code: string;
+  name: string;
+  unit: string;
+  allocated: number;
+  issued: number;
+  remaining: number;
+};
+
+/** For the issue screen: every open order's earmarks, keyed by order id, so the cart can show what is left before Confirm. */
+export async function listOpenOrderAllocations(): Promise<Record<string, OrderAllocationRow[]>> {
+  await requirePermission('store.read');
+  // Two queries for every open order at once (not two per order): the earmarks, then the issues
+  // against those orders. The same "issues after the first earmark" rule as allocationFigures.
+  const allocations = await db.misOrderStockAllocation.findMany({
+    where: { order: { status: { in: ['CONFIRMED', 'IN_PRODUCTION'] } } },
+    select: { orderId: true, itemId: true, allocatedQty: true, createdAt: true, item: { select: { code: true, name: true, unit: true } } },
+  });
+  if (allocations.length === 0) return {};
+  const orderIds = [...new Set(allocations.map((a) => a.orderId))];
+  const itemIds = [...new Set(allocations.map((a) => a.itemId))];
+  const [issues, returns] = await Promise.all([
+    db.misInventoryLedger.findMany({
+      where: { source: 'STORE_ISSUE', sourceId: { in: orderIds }, itemId: { in: itemIds } },
+      select: { sourceId: true, itemId: true, changeQty: true, createdAt: true },
+    }),
+    acceptedReturns(db, { orderId: { in: orderIds }, itemId: { in: itemIds } }), // R2-285
+  ]);
+  const figures = foldAllocationFigures(
+    allocations.map((a) => ({ orderId: a.orderId, itemId: a.itemId, allocatedQty: a.allocatedQty.toNumber(), createdAt: a.createdAt })),
+    [...issues.map((i) => ({ orderId: i.sourceId ?? '', itemId: i.itemId, changeQty: i.changeQty.toNumber(), createdAt: i.createdAt })), ...returns],
+    { allocation: (a) => `${a.orderId}|${a.itemId}`, issue: (i) => `${i.orderId}|${i.itemId}` },
+  );
+  const itemOf = new Map(allocations.map((a) => [`${a.orderId}|${a.itemId}`, a.item]));
+  const out: Record<string, OrderAllocationRow[]> = {};
+  for (const [key, f] of figures) {
+    const [orderId, itemId] = key.split('|');
+    (out[orderId] ??= []).push({ itemId, ...itemOf.get(key)!, allocated: f.allocated, issued: f.issued, remaining: remainingAllocation(f) });
+  }
+  for (const rows of Object.values(out)) rows.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+/** What the order screen shows: every item earmarked for the order, with what is left to issue. */
+export async function getOrderAllocations(orderId: string): Promise<OrderAllocationRow[]> {
+  await requirePermission('orders.read');
+  const allocations = await db.misOrderStockAllocation.findMany({
+    where: { orderId },
+    select: { itemId: true, item: { select: { code: true, name: true, unit: true } } },
+    distinct: ['itemId'],
+  });
+  if (allocations.length === 0) return [];
+  const figures = await allocationFigures(db, orderId, allocations.map((a) => a.itemId));
+  return allocations
+    .map((a) => {
+      const f = figures.get(a.itemId) ?? { allocated: 0, issued: 0 };
+      return { itemId: a.itemId, ...a.item, allocated: f.allocated, issued: f.issued, remaining: remainingAllocation(f) };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export type OrderBomMaterialRow = {
+  stageName: string;
+  description: string;
+  itemId: string | null;
+  required: number;
+  unit: string;
+  /** Issued-so-far against THIS order, for a catalogued material; null for one with no itemId (nothing to match against the ledger). */
+  issued: number | null;
+  remaining: number | null;
+};
+
+/**
+ * R2-121: the BOM stage materials behind every open order with an APPROVED BOM, so the Issue
+ * screen can show what the BOM actually calls for and how much of it has gone out — not just the
+ * aggregate `MisOrderStockAllocation` figure. Read-only context: issuance is still capped by the
+ * allocation figure above, same as before (D1's earmark rule is unchanged by this).
+ */
+export async function listOpenOrderBomMaterials(): Promise<Record<string, OrderBomMaterialRow[]>> {
+  await requirePermission('store.read');
+  const boms = await db.misBom.findMany({
+    where: { status: 'APPROVED', order: { status: { in: ['CONFIRMED', 'IN_PRODUCTION'] } } },
+    select: {
+      orderId: true,
+      // R2-268: BOM quantities are per finished unit; the order's quantity scales them (an order without one reads as x1).
+      order: { select: { quantity: true } },
+      stages: {
+        orderBy: { seq: 'asc' },
+        select: { stageName: true, materials: { orderBy: { seq: 'asc' }, select: { description: true, itemId: true, quantity: true, unit: true } } },
+      },
+    },
+  });
+  if (boms.length === 0) return {};
+
+  const orderIds = boms.map((b) => b.orderId);
+  const itemIds = [...new Set(boms.flatMap((b) => b.stages.flatMap((s) => s.materials.flatMap((m) => (m.itemId ? [m.itemId] : [])))))];
+  const issues = itemIds.length > 0
+    ? await db.misInventoryLedger.findMany({ where: { source: 'STORE_ISSUE', sourceId: { in: orderIds }, itemId: { in: itemIds } }, select: { sourceId: true, itemId: true, changeQty: true } })
+    : [];
+  const issuedByKey = new Map<string, number>();
+  for (const i of issues) {
+    const key = `${i.sourceId}|${i.itemId}`;
+    issuedByKey.set(key, (issuedByKey.get(key) ?? 0) - i.changeQty.toNumber()); // STORE_ISSUE writes a negative changeQty
+  }
+
+  const out: Record<string, OrderBomMaterialRow[]> = {};
+  for (const bom of boms) {
+    const q = bom.order?.quantity;
+    const orderQty = q == null ? 1 : typeof q === 'object' ? q.toNumber() : Number(q);
+    out[bom.orderId] = bom.stages.flatMap((stage) =>
+      stage.materials.map((m) => {
+        const required = m.quantity.toNumber() * orderQty;
+        const issued = m.itemId ? issuedByKey.get(`${bom.orderId}|${m.itemId}`) ?? 0 : null;
+        return {
+          stageName: stage.stageName,
+          description: m.description,
+          itemId: m.itemId,
+          required,
+          unit: m.unit,
+          issued,
+          remaining: issued === null ? null : Math.max(0, required - issued),
+        };
+      }),
+    );
+  }
+  return out;
+}

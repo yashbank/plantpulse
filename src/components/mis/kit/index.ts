@@ -1,0 +1,36 @@
+/**
+ * The MIS component kit.
+ *
+ * Import from here, not from the individual files, so a later change of
+ * implementation is one edit rather than sixty.
+ *
+ * Toast and ConfirmDialog are deliberately NOT re-implemented here — the live
+ * app already ships both and forking them would give the product two
+ * behaviours for the same thing.
+ */
+
+export { Button, type ButtonProps } from './button';
+export { Card, CardRow, type CardTone } from './card';
+export { DataTable, type Column, type DataTableProps } from './data-table';
+export { EmptyState } from './empty-state';
+export { DateInput, Input, NumberInput, TimeInput, type InputProps } from './input';
+export { Select, type SelectOption, type SelectProps } from './select';
+export { Skeleton, SkeletonList, SkeletonTable, SkeletonKpi, SkeletonDetail, SkeletonForm } from './skeleton';
+export { SearchInput, type SearchInputProps } from './search-input';
+export { FilterBar, type FilterBarProps } from './filter-bar';
+export { Tabs, type TabItem } from './tabs';
+export { useDebouncedValue } from './use-debounced-value';
+export { SlideOver, type SlideOverProps } from './slide-over';
+export { StatusBadge, type BadgeTone, type BadgeModule } from './status-badge';
+
+export { ToastProvider, useToast } from '@/components/ui/toast';
+export { useConfirm, type ConfirmOptions } from '@/components/ui/confirm-dialog';
+export { Pagination, HiddenParams } from './pagination';
+export { ListToolbar, useListNav } from './list-toolbar';
+export { RangeTabs } from './range-tabs';
+export { IconAction } from './icon-action';
+export { RowActions, type RowActionItem } from './row-actions';
+export { PageHeader, type PageHeaderProps, type Crumb } from './page-header';
+export { RouteProgress } from './route-progress';
+export { SpotlightCard } from './spotlight-card';
+export { CountUp, type CountUpProps } from './count-up';

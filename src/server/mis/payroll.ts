@@ -1,0 +1,518 @@
+import { resolveAsOf } from '@/lib/mis/effective-dated';
+import { daysInMonth, extraPayMultiplierUnit, otPayForDay, perDayRate, type WageRowForCalc } from '@/lib/mis/pay-basis';
+import type { Prisma } from '@/generated/prisma/client';
+import { db } from '@/server/db';
+import { requirePermission } from '@/server/mis/auth';
+import type { PayrollPolicyRuleKey } from '@/lib/mis/rule-keys';
+import { buildPayrollPolicy, hraAfterRentPolicy, isWeekday, weeklyOffIsPaid, type PayrollPolicy } from '@/lib/mis/payroll-policy';
+import { getWageRuleHistory } from '@/server/mis/business-rules';
+import { DEFAULT_DAILY_WAGE_CODE, getWageTypeRowsForCodes } from '@/server/mis/wage-type';
+import { getPayComponentsForEmployees, type PayComponentMap } from '@/server/mis/pay-components';
+import { listApprovedExtraPayDaysForMonth, type ExtraPayDayRow } from '@/server/mis/extra-pay-days';
+import { hasApprovedHalfDayLeave, isPaidLeaveDay } from '@/lib/mis/leave-pay';
+import { getLeavePayRulesForMonth } from '@/server/mis/leave-pay';
+import { deductionsFor, type Deductions } from '@/lib/mis/payroll-deductions';
+
+/** Attendance statuses that earn a day's basic wage, and what fraction of it. */
+const DAY_FRACTION: Record<string, number> = { PRESENT: 1, HALF_DAY: 0.5 };
+
+export type PayrollRow = {
+  employeeId: string;
+  employeeName: string;
+  employeeCode: string;
+  payType: 'MONTHLY' | 'DAILY';
+  workingDays: number;
+  present: number;
+  absent: number;
+  leave: number;
+  halfDay: number;
+  totalLateMinutes: number;
+  totalOTMinutes: number;
+  allowanceDays: number;
+  basicWage: number;
+  hra: number;
+  allowance: number;
+  otPay: number;
+  bonus: number;
+  extraPay: number;
+  latePenalty: number;
+  grossPay: number;
+  /** R2-324: statutory deductions, the advance recovered this month and what is actually paid out. */
+  pf: number;
+  esic: number;
+  pt: number;
+  advance: number;
+  netPay: number;
+  wageTypeCode: string | null;
+  /** Set on a live (OPEN period) row when no wage code could be resolved at all — 25.1's data-health finding. */
+  needsPayCode?: boolean;
+};
+
+type AttendanceRow = {
+  id: string;
+  date: Date;
+  status: string;
+  lateMinutes: number | null;
+  otMinutes: number | null;
+  employee: {
+    id: string;
+    name: string;
+    employeeCode: string;
+    payType?: 'MONTHLY' | 'DAILY' | null;
+    sundayPaid?: boolean | null;
+    wageTypeCode?: string | null;
+    /** R3 B43: DEPARTMENTS-scoped extra-pay days match on this. */
+    departmentId?: string | null;
+  } | null;
+};
+
+/** The employee as `computeEmployeeMonth` needs it (an attendance row's `employee`, or a zero-row employee). */
+type PayrollEmployee = NonNullable<AttendanceRow['employee']>;
+
+/** R3 B47: only "the table does not exist yet" (a pre-migration database) reads as "no period". Anything else is a real failure. */
+function isMissingRelationError(error: unknown): boolean {
+  const e = error as { code?: unknown; message?: unknown } | null;
+  return e?.code === 'P2021' || (typeof e?.message === 'string' && /relation .* does not exist/i.test(e.message));
+}
+
+async function findPayrollPeriod(client: Prisma.TransactionClient, year: number, month: number) {
+  try {
+    return await client.misPayrollPeriod.findUnique({ where: { year_month: { year, month } } });
+  } catch (error) {
+    if (isMissingRelationError(error)) return null;
+    throw error;
+  }
+}
+
+function round(n: number): number {
+  return Math.round(n);
+}
+
+/** A snapshot line, read back in the same shape `calculateMonthlyPayroll` returns live. */
+function snapshotToRow(line: {
+  employeeId: string; employeeCode: string; employeeName: string; payType: 'MONTHLY' | 'DAILY';
+  workingDays: number; present: number; halfDay: number; absent: number; leave: number;
+  otMinutes: number; lateMinutes: number; allowanceDays: number;
+  basicWage: unknown; hra: unknown; allowance: unknown; otPay: unknown; bonus: unknown; extraPay: unknown; latePenalty: unknown; grossPay: unknown;
+  pf?: unknown; esic?: unknown; pt?: unknown; advance?: unknown; netPay?: unknown;
+  wageTypeCode: string | null;
+}, deductionsNow: (pay: { basicWage: number; grossPay: number }) => Deductions): PayrollRow {
+  const n = (v: unknown) => Number(v);
+  // R2-324: a line frozen before the deduction columns existed is completed from today's rules.
+  const frozen: Deductions = line.netPay == null
+    ? deductionsNow({ basicWage: n(line.basicWage), grossPay: n(line.grossPay) })
+    : { pf: n(line.pf ?? 0), esic: n(line.esic ?? 0), pt: n(line.pt ?? 0), advance: n(line.advance ?? 0), netPay: n(line.netPay) };
+  return {
+    employeeId: line.employeeId,
+    employeeName: line.employeeName,
+    employeeCode: line.employeeCode,
+    payType: line.payType,
+    workingDays: line.workingDays,
+    present: line.present,
+    absent: line.absent,
+    leave: line.leave,
+    halfDay: line.halfDay,
+    totalLateMinutes: line.lateMinutes,
+    totalOTMinutes: line.otMinutes,
+    allowanceDays: line.allowanceDays,
+    basicWage: n(line.basicWage),
+    hra: n(line.hra),
+    allowance: n(line.allowance),
+    otPay: n(line.otPay),
+    bonus: n(line.bonus),
+    extraPay: n(line.extraPay),
+    latePenalty: n(line.latePenalty),
+    grossPay: n(line.grossPay),
+    ...frozen,
+    wageTypeCode: line.wageTypeCode,
+  };
+}
+
+/**
+ * One employee's whole month, live — the day-by-day loop 25.1–25.5 extend.
+ *
+ * Every rate is read AS OF EACH DAY (F-08, D27): `resolveAsOf` on the employee's own wage-code
+ * history, never "as of now". HRA/Allowance/Bonus are monthly entitlements on the code, not
+ * day-priced, so they are resolved once as of the period's LAST day (the figure the month will
+ * actually close on) rather than per attendance day.
+ */
+function computeEmployeeMonth(
+  emp: PayrollEmployee,
+  records: AttendanceRow[],
+  year: number,
+  month: number,
+  wageHistory: (WageRowForCalc & { effectiveFrom: Date })[] | undefined,
+  policy: PayrollPolicy,
+  latePenaltyOn: (date: Date) => number,
+  fallbackDailyWageOn: (date: Date) => number,
+  components: PayComponentMap,
+  extraPayDays: ExtraPayDayRow[],
+  workingDays: number,
+  /** R2-102: true when this LEAVE day is covered by an approved leave of a type the Owner marked PAID. */
+  paidLeaveOn: (date: Date) => boolean = () => false,
+  /** R2-167: true when this HALF_DAY row is an approved half-day leave and the Owner marked half-day leave PAID (its leave half is paid too). */
+  paidHalfDayOn: (date: Date) => boolean = () => false,
+): Omit<PayrollRow, 'pf' | 'esic' | 'pt' | 'advance' | 'netPay'> {
+  const { otMultiplierOn } = policy;
+  const payType: 'MONTHLY' | 'DAILY' = emp.payType === 'MONTHLY' ? 'MONTHLY' : 'DAILY';
+  // R2-236 / R2-245: a DAILY worker the Owner marked `sundayPaid` earns the weekly off exactly like a MONTHLY one
+  // (same `attendance.weekly_off` day, same sandwich rule). Without the flag a daily worker is paid only for days worked.
+  const paidWeeklyOff = payType === 'MONTHLY' || emp.sundayPaid === true;
+  const monthEnd = new Date(Date.UTC(year, month, 0));
+
+  const rowOn = (date: Date) => (wageHistory ? resolveAsOf(wageHistory, date) : null);
+  const dayRateOn = (date: Date) => {
+    const row = rowOn(date);
+    return row ? perDayRate(row, fallbackDailyWageOn(date), year, month) : fallbackDailyWageOn(date);
+  };
+
+  const seenDates = new Set(records.map((r) => r.date.toISOString().slice(0, 10)));
+
+  let present = 0, halfDay = 0, absent = 0, leave = 0, allowanceDays = 0;
+  let totalLateMinutes = 0, totalOTMinutes = 0;
+  let workedDays = 0;
+  const statusByDay = new Map(records.map((r) => [r.date.toISOString().slice(0, 10), r.status]));
+
+  // R2-231: was this day worked (so it can hold up a weekly off beside it)? A day outside the month
+  // has no data here, so it gets the benefit of the doubt.
+  const workedOn = (date: Date): boolean => {
+    if (date.getUTCMonth() !== month - 1 || date.getUTCFullYear() !== year) return true;
+    const status = statusByDay.get(date.toISOString().slice(0, 10));
+    return status === 'PRESENT' || status === 'HALF_DAY' || (status === 'LEAVE' && paidLeaveOn(date));
+  };
+  const weeklyOffPaidOn = (date: Date): boolean => {
+    if (!paidWeeklyOff || !isWeekday(date, policy.weeklyOffOn(date))) return false;
+    const before = new Date(date.getTime() - 86_400_000);
+    const after = new Date(date.getTime() + 86_400_000);
+    return weeklyOffIsPaid(policy.sandwichOn(date), workedOn(before), workedOn(after));
+  };
+  let basicWage = 0, otPay = 0, latePenaltyTotal = 0;
+
+  const priceDay = (date: Date, status: string, lateMinutes: number, otMinutes: number, synthetic: boolean) => {
+    const monthlySunday = weeklyOffPaidOn(date);
+    // R2-102: a PAID leave day earns a full day at the same day rate as a present day (same pay basis,
+    // same wage code as of that day); an UNPAID one (LWP, Other, or a LEAVE mark with no approved
+    // request behind it) earns nothing, as before.
+    const paidLeave = !synthetic && status === 'LEAVE' && paidLeaveOn(date);
+    const paidHalfDay = !synthetic && status === 'HALF_DAY' && paidHalfDayOn(date);
+    const fraction = monthlySunday || paidLeave || paidHalfDay ? 1 : (DAY_FRACTION[status] ?? 0);
+    const dayRate = dayRateOn(date);
+    const row = rowOn(date);
+
+    if (monthlySunday) allowanceDays += 1;
+    // R2-232: a paid weekly off counts toward the HRA minimum only when the rule says so.
+    workedDays += monthlySunday && policy.rentCountHolidaysOn(date) ? 1 : synthetic ? 0 : (DAY_FRACTION[status] ?? 0);
+    if (!synthetic) {
+      // "present" counts both a full PRESENT day and a HALF_DAY (the original shape) — a
+      // monthly-employee's paid-but-unmarked Sunday is not folded into it, since it is a pay
+      // POLICY, not an attendance fact; the same is true of `absent`/`leave` below.
+      if (status === 'PRESENT' || status === 'HALF_DAY') present += 1;
+      if (status === 'HALF_DAY') halfDay += 1;
+      if (status === 'ABSENT') absent += 1;
+      if (status === 'LEAVE') leave += 1;
+      totalLateMinutes += lateMinutes;
+      totalOTMinutes += otMinutes;
+      latePenaltyTotal += lateMinutes * latePenaltyOn(date);
+      otPay += otPayForDay(otMinutes, dayRate, row?.otRatePerHour ?? null, otMultiplierOn(date));
+    }
+    basicWage += fraction * dayRate;
+  };
+
+  for (const r of records) {
+    priceDay(r.date, r.status, r.lateMinutes ?? 0, r.otMinutes ?? 0, false);
+  }
+
+  // 25.3: a MONTHLY employee is paid every Sunday, including one with no attendance row at all
+  // (the normal case — nobody clocks in on a day off). A Sunday that DOES have a row was already
+  // priced as a paid Sunday above (`monthlySunday` overrides its own status); this only fills the
+  // gap for Sundays no row exists for. R2-236: a `sundayPaid` DAILY worker is filled the same way.
+  if (paidWeeklyOff) {
+    for (let d = 1; d <= workingDays; d++) {
+      const date = new Date(Date.UTC(year, month - 1, d));
+      if (!seenDates.has(date.toISOString().slice(0, 10)) && weeklyOffPaidOn(date)) {
+        priceDay(date, 'PRESENT', 0, 0, true);
+      }
+    }
+  }
+
+  // 25.1: HRA/Allowance/Bonus are monthly entitlements on the wage code, not day-priced — resolved
+  // once, as of the period's own last day, and zeroed by the per-employee toggle when off.
+  const closingRow = rowOn(monthEnd);
+  const fullHra = components.HRA && closingRow?.hraAmount ? closingRow.hraAmount : 0;
+  // R2-232: HRA is forfeited when the month's worked days fall short of `salary.rent_min_days`.
+  const hra = hraAfterRentPolicy(fullHra, workedDays, policy.rentMinDaysOn(monthEnd));
+  const allowance = components.ALLOWANCE && closingRow?.allowanceAmount ? closingRow.allowanceAmount : 0;
+  const bonus = components.BONUS && closingRow?.bonusAmount ? closingRow.bonusAmount : 0;
+
+  // 25.4/25.5: approved extra-pay days touching this employee (by scope), additive with OT —
+  // deliberately a separate accumulator so a day with both never lets one silently absorb the other.
+  let extraPay = 0;
+  for (const day of extraPayDays) {
+    // R3 B45: ALL_PRESENT pays by the attendance fraction (a HALF_DAY gets half); the other scopes pay in full.
+    let fraction = 1;
+    let inScope = false;
+    if (day.scope === 'ALL_PRESENT') {
+      const present = records.find((r) => r.date.getTime() === day.date.getTime() && DAY_FRACTION[r.status] > 0);
+      inScope = !!present;
+      fraction = present ? DAY_FRACTION[present.status] : 0;
+    } else if (day.scope === 'EMPLOYEES') {
+      inScope = day.employeeIds.includes(emp.id);
+    } else {
+      // R3 B43: DEPARTMENTS - the employee's own department, loaded with the payroll query.
+      inScope = !!emp.departmentId && day.departmentIds.includes(emp.departmentId);
+    }
+    if (!inScope) continue;
+    const row = rowOn(day.date);
+    const dayRate = dayRateOn(day.date);
+    if (day.kind === 'FLAT_AMOUNT') extraPay += day.value * fraction;
+    else extraPay += day.value * fraction * extraPayMultiplierUnit(payType, dayRate, row?.multiplierBasis ?? 'PER_MONTH');
+  }
+
+  const basicWageOn = components.BASIC ? basicWage : 0;
+  const otPayOn = components.OT ? otPay : 0;
+  // R2-107: a late penalty can take the month to zero, never below it. The penalty is capped at
+  // the month's earnings, so the payslip's own lines still add up (earnings − penalty = gross ≥ 0).
+  const earnings = basicWageOn + otPayOn + hra + allowance + bonus + extraPay;
+  const latePenaltyApplied = Math.min(latePenaltyTotal, earnings);
+  const grossPay = Math.max(0, earnings - latePenaltyApplied);
+
+  return {
+    employeeId: emp.id,
+    employeeName: emp.name,
+    employeeCode: emp.employeeCode,
+    payType,
+    workingDays,
+    present,
+    absent,
+    leave,
+    halfDay,
+    totalLateMinutes,
+    totalOTMinutes,
+    allowanceDays,
+    basicWage: round(basicWageOn),
+    hra: round(hra),
+    allowance: round(allowance),
+    otPay: round(otPayOn),
+    bonus: round(bonus),
+    extraPay: round(extraPay),
+    latePenalty: round(latePenaltyApplied),
+    grossPay: round(grossPay),
+    wageTypeCode: emp.wageTypeCode ?? null,
+    needsPayCode: !emp.wageTypeCode && !closingRow,
+  };
+}
+
+/**
+ * Every payslip figure — basic pay, HRA, allowance, OT pay, bonus, extra pay, late penalty, gross
+ * pay — is a wage, so the gate is `wages.read` (Owner only, S9 / D24). It used to be
+ * `attendance.read`, the permission of the screen that happened to call it, which four non-Owner
+ * roles hold (F-01).
+ *
+ * CLOSED month (D27, Phase 25): once `MisPayrollPeriod.status` is CLOSED, this reads the frozen
+ * `MisPayrollSnapshotLine` rows instead of recomputing — a rate back-dated into a closed month can
+ * no longer move it. OPEN (the default until Phase 25's close flow runs) computes live, as before,
+ * now per-employee: each employee prices at THEIR OWN wage code (`wageTypeCode`), falling back to
+ * the historic global default (`DEFAULT_DAILY_WAGE_CODE`) or the `DAILY_WAGE_DEFAULT` business
+ * rule for anyone with no code set — the pre-Phase-25 behaviour, unchanged, for an employee this
+ * phase has not touched.
+ *
+ * The month is a run of DATE values (`@db.Date`, UTC midnight), so its bounds are built in UTC — a
+ * server-local `new Date(year, month, 0)` would drop the last day of the month on any server east
+ * of Greenwich (D22; one of the Phase 13 sweep sites).
+ */
+export async function calculateMonthlyPayroll(year: number, month: number, client: Prisma.TransactionClient = db): Promise<PayrollRow[]> {
+  await requirePermission('wages.read');
+  return computePayroll(year, month, client, null);
+}
+
+/**
+ * R2-112: one employee's payslip line — the same arithmetic as `calculateMonthlyPayroll`, but every
+ * query is scoped to that one employee (their attendance, their roster row, their snapshot line),
+ * so opening a payslip never recomputes the whole factory. `null` when they have no line that month.
+ */
+export async function calculateEmployeePayroll(
+  employeeId: string,
+  year: number,
+  month: number,
+  client: Prisma.TransactionClient = db,
+): Promise<PayrollRow | null> {
+  await requirePermission('wages.read');
+  const rows = await computePayroll(year, month, client, employeeId);
+  return rows.find((r) => r.employeeId === employeeId) ?? null;
+}
+
+/** R2-228/231/232: one payroll-policy rule's history. Not exported: only a `wages.read` caller reaches payroll. */
+async function policyRuleHistory(client: Prisma.TransactionClient, ruleKey: PayrollPolicyRuleKey) {
+  const rows = await client.misBusinessRule.findMany({ where: { ruleKey }, orderBy: { effectiveFrom: 'asc' } });
+  return rows.map((r) => ({ effectiveFrom: r.effectiveFrom, ruleValue: r.ruleValue }));
+}
+
+async function computePayroll(year: number, month: number, client: Prisma.TransactionClient, onlyEmployeeId: string | null): Promise<PayrollRow[]> {
+  const scope = onlyEmployeeId ? { employeeId: onlyEmployeeId } : {};
+  const period = await findPayrollPeriod(client, year, month);
+  const monthEnd = new Date(Date.UTC(year, month, 0));
+  // R2-324: the deduction rules, as of the month's last day.
+  const deductionHistories = async () => {
+    const [pfPercent, esicPercent, esicCeiling, ptMonthly, ptMinGross] = await Promise.all([
+      policyRuleHistory(client, 'salary.pf_percent'),
+      policyRuleHistory(client, 'salary.esic_percent'),
+      policyRuleHistory(client, 'salary.esic_ceiling'),
+      policyRuleHistory(client, 'salary.pt_monthly'),
+      policyRuleHistory(client, 'salary.pt_min_gross'),
+    ]);
+    return { pfPercent, esicPercent, esicCeiling, ptMonthly, ptMinGross };
+  };
+  if (period?.status === 'CLOSED') {
+    const [lines, ded] = await Promise.all([
+      client.misPayrollSnapshotLine.findMany({ where: { periodId: period.id, ...scope }, orderBy: { employeeName: 'asc' } }),
+      deductionHistories(),
+    ]);
+    const frozenPolicy = buildPayrollPolicy({ otRate: [], otMultiplier: [], weeklyOff: [], sandwich: [], rentMinDays: [], rentCountHolidays: [], ...ded });
+    return lines.map((line) => snapshotToRow(line, (pay) => deductionsFor(pay, frozenPolicy.deductionsOn(monthEnd))));
+  }
+
+  const [dailyRule, otRule, lateRule, otRate, weeklyOff, sandwich, rentMinDays, rentCountHolidays, ded, advances] = await Promise.all([
+    getWageRuleHistory('DAILY_WAGE_DEFAULT'),
+    getWageRuleHistory('OT_MULTIPLIER'),
+    getWageRuleHistory('LATE_PENALTY_PER_MIN'),
+    policyRuleHistory(client, 'attendance.ot_rate'),
+    policyRuleHistory(client, 'attendance.weekly_off'),
+    policyRuleHistory(client, 'sunday.paid_if_adjacent'),
+    policyRuleHistory(client, 'salary.rent_min_days'),
+    policyRuleHistory(client, 'salary.rent_count_holidays'),
+    deductionHistories(),
+    salaryAdvancesFor(client, year, month, onlyEmployeeId),
+  ]);
+  const policy = buildPayrollPolicy({ otRate, otMultiplier: otRule, weeklyOff, sandwich, rentMinDays, rentCountHolidays, ...ded });
+  const deductionPolicy = policy.deductionsOn(monthEnd);
+  const fallbackDailyWageOn = (date: Date): number => parseFloat(resolveAsOf(dailyRule, date)?.ruleValue ?? '500');
+  const latePenaltyOn = (date: Date): number => parseFloat(resolveAsOf(lateRule, date)?.ruleValue ?? '0');
+
+  const start = new Date(Date.UTC(year, month - 1, 1));
+  const end = new Date(Date.UTC(year, month, 0));
+  const workingDays = daysInMonth(year, month);
+
+  const attendance: AttendanceRow[] = await client.misAttendance.findMany({
+    where: { date: { gte: start, lte: end }, ...scope },
+    include: {
+      employee: { select: { id: true, name: true, employeeCode: true, payType: true, sundayPaid: true, wageTypeCode: true, departmentId: true } },
+      shift: { select: { name: true } },
+    },
+    orderBy: [{ employee: { name: 'asc' } }, { date: 'asc' }],
+  });
+
+  // R2-102: which LEAVE days are paid. Read only when the month has a LEAVE row in scope, so a month
+  // without leave costs no extra query.
+  const leaveEmployeeIds = [...new Set(attendance.filter((a) => (a.status === 'LEAVE' || a.status === 'HALF_DAY') && a.employee).map((a) => a.employee!.id))];
+  let paidLeaveOn: (employeeId: string, date: Date) => boolean = () => false;
+  let paidHalfDayOn: (employeeId: string, date: Date) => boolean = () => false;
+  if (leaveEmployeeIds.length > 0) {
+    const [{ pay: leavePay, halfDayPaid }, approvedLeaves] = await Promise.all([
+      getLeavePayRulesForMonth(year, month, client),
+      client.misLeaveRequest.findMany({
+        where: {
+          status: 'APPROVED',
+          employeeId: { in: leaveEmployeeIds },
+          date: { lte: end },
+          OR: [{ endDate: null, date: { gte: start } }, { endDate: { gte: start } }],
+        },
+        select: { employeeId: true, date: true, endDate: true, leaveType: true },
+      }),
+    ]);
+    paidLeaveOn = (employeeId, date) => isPaidLeaveDay(approvedLeaves, employeeId, date, leavePay);
+    paidHalfDayOn = (employeeId, date) => halfDayPaid && hasApprovedHalfDayLeave(approvedLeaves, employeeId, date);
+  }
+
+  const byEmployee: Record<string, AttendanceRow[]> = {};
+  for (const a of attendance) {
+    const empId = a.employee?.id ?? 'unknown';
+    if (!byEmployee[empId]) byEmployee[empId] = [];
+    byEmployee[empId].push(a);
+  }
+  // R3 B44: every active, non-deleted employee with a wage code gets a line, even with no attendance
+  // rows at all (a MONTHLY employee is still paid Sundays, allowances and extra-pay days).
+  const rosterEmployees = (await client.misEmployee.findMany({
+    where: { deletedAt: null, isActive: true, wageTypeCode: { not: null }, ...(onlyEmployeeId ? { id: onlyEmployeeId } : {}) },
+    select: { id: true, name: true, employeeCode: true, payType: true, sundayPaid: true, wageTypeCode: true, departmentId: true },
+  })) as PayrollEmployee[];
+  const zeroRowEmployees = rosterEmployees.filter((e) => !byEmployee[e.id]);
+  const employeeIds = [...Object.keys(byEmployee).filter((id) => id !== 'unknown'), ...zeroRowEmployees.map((e) => e.id)];
+
+  // Batch: every distinct wage code this run needs, and every employee's component toggles and
+  // approved extra-pay days — one query each, never one per employee (§2A.13).
+  const codes = new Set<string>();
+  for (const recs of Object.values(byEmployee)) codes.add(recs[0].employee?.wageTypeCode || DEFAULT_DAILY_WAGE_CODE);
+  for (const e of zeroRowEmployees) codes.add(e.wageTypeCode || DEFAULT_DAILY_WAGE_CODE);
+  const [wageHistories, componentsByEmployee, extraPayDays] = await Promise.all([
+    getWageTypeRowsForCodes([...codes]),
+    getPayComponentsForEmployees(employeeIds),
+    listApprovedExtraPayDaysForMonth(year, month),
+  ]);
+
+  const defaultComponents: PayComponentMap = { BASIC: true, HRA: true, ALLOWANCE: true, OT: true, BONUS: true };
+  const lines: { emp: PayrollEmployee; records: AttendanceRow[] }[] = [
+    ...Object.values(byEmployee).map((records) => ({ emp: records[0].employee!, records })),
+    ...zeroRowEmployees.map((emp) => ({ emp, records: [] as AttendanceRow[] })),
+  ];
+
+  return lines.map(({ emp, records }) => {
+    const code = emp.wageTypeCode || DEFAULT_DAILY_WAGE_CODE;
+    const row = computeEmployeeMonth(
+      emp,
+      records,
+      year,
+      month,
+      wageHistories.get(code),
+      policy,
+      latePenaltyOn,
+      fallbackDailyWageOn,
+      componentsByEmployee.get(emp.id) ?? defaultComponents,
+      extraPayDays,
+      workingDays,
+      (date) => paidLeaveOn(emp.id, date),
+      (date) => paidHalfDayOn(emp.id, date),
+    );
+    // R2-324: PF / ESIC / PT from the rules, the Owner's advance for this month, and the net that is paid out.
+    return { ...row, ...deductionsFor(row, deductionPolicy, advances.get(emp.id) ?? 0) };
+  });
+}
+
+/**
+ * R2-324: the advances the Owner recorded for recovery in this month, per employee. Optional call: narrow hand-built
+ * test doubles carry no advance delegate; a real client always does.
+ */
+async function salaryAdvancesFor(client: Prisma.TransactionClient, year: number, month: number, onlyEmployeeId: string | null): Promise<Map<string, number>> {
+  const delegate = (client as unknown as { misSalaryAdvance?: { findMany: (args: { where: object; select: object }) => Promise<{ employeeId: string; amount: unknown }[]> } }).misSalaryAdvance;
+  const rows = (typeof delegate?.findMany === 'function' ? await delegate.findMany({ where: { year, month, ...(onlyEmployeeId ? { employeeId: onlyEmployeeId } : {}) }, select: { employeeId: true, amount: true } }) : null) ?? [];
+  const out = new Map<string, number>();
+  for (const r of rows) out.set(r.employeeId, (out.get(r.employeeId) ?? 0) + Number(r.amount));
+  return out;
+}
+
+export type MonthWageBill = {
+  year: number;
+  month: number;
+  headcount: number;
+  gross: number;
+  basic: number;
+  ot: number;
+};
+
+/**
+ * The month-to-date wage bill, for the one card that carries money.
+ *
+ * Gated on 'wages.read', which the matrix grants to OWNER alone — so this can
+ * never be called into by an admin page that grew a wage figure by accident.
+ */
+export async function getMonthWageBill(year: number, month: number): Promise<MonthWageBill> {
+  await requirePermission('wages.read');
+  const rows = await calculateMonthlyPayroll(year, month);
+  return {
+    year,
+    month,
+    headcount: rows.length,
+    gross: rows.reduce((s, r) => s + r.grossPay, 0),
+    basic: rows.reduce((s, r) => s + r.basicWage, 0),
+    ot: rows.reduce((s, r) => s + r.otPay, 0),
+  };
+}

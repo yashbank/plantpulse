@@ -1,0 +1,123 @@
+'use client';
+
+import { PageHeader } from '@/components/mis/kit/page-header';
+import Link from 'next/link';
+import { DataTable, type Column } from '@/components/mis/kit/data-table';
+import { StatusBadge, type BadgeTone } from '@/components/mis/kit/status-badge';
+import { Pagination } from '@/components/mis/kit/pagination';
+import { ListToolbar } from '@/components/mis/kit/list-toolbar';
+import { IconAction } from '@/components/mis/kit/icon-action';
+import { ClipboardCheck, Eye, FilePlus2, Pencil } from 'lucide-react';
+import { pageHref, parseView } from '@/lib/mis/pagination';
+import type { BomOverviewRow } from '@/server/mis/bom';
+
+const BOM_STATUS_LABEL: Record<BomOverviewRow['bomStatus'], string> = {
+  NO_BOM: 'No BOM',
+  DRAFT: 'Draft',
+  PENDING_APPROVAL: 'Pending Approval',
+  APPROVED: 'Approved',
+};
+
+const BOM_STATUS_TONE: Record<BomOverviewRow['bomStatus'], BadgeTone> = {
+  NO_BOM: 'neutral',
+  DRAFT: 'warning',
+  PENDING_APPROVAL: 'info',
+  APPROVED: 'good',
+};
+
+type Counts = { ALL: number; NO_BOM: number; DRAFT: number; PENDING_APPROVAL: number; APPROVED: number };
+
+const TABS: { key: 'ALL' | BomOverviewRow['bomStatus']; label: string }[] = [
+  { key: 'ALL', label: 'All' },
+  { key: 'PENDING_APPROVAL', label: 'Pending Approval' },
+  { key: 'DRAFT', label: 'Draft' },
+  { key: 'APPROVED', label: 'Approved' },
+  { key: 'NO_BOM', label: 'No BOM' },
+];
+
+/** R2-142: the row action follows the BOM's state. */
+const CTA: Record<BomOverviewRow['bomStatus'], { label: string; edit: boolean; icon: typeof Eye }> = {
+  NO_BOM: { label: '+ Create BOM', edit: true, icon: FilePlus2 },
+  DRAFT: { label: 'Continue Editing', edit: true, icon: Pencil },
+  PENDING_APPROVAL: { label: 'Review & Approve', edit: false, icon: ClipboardCheck },
+  APPROVED: { label: 'View BOM', edit: false, icon: Eye },
+};
+
+type Paging = { total: number; page: number; params: Record<string, string | undefined> };
+
+/** R2-122/123/137/143: a paged (10/page) BOM list with header-level order + BOM lifecycle data, so a role can tell draft from approved without opening each order. */
+export function BomListScreen({ rows, paging, counts }: { rows: BomOverviewRow[]; paging?: Paging; counts?: Counts }) {
+  const status = paging?.params.status ?? '';
+  const view = parseView(paging?.params.view);
+
+  const columns: Column<BomOverviewRow>[] = [
+    {
+      key: 'order',
+      header: 'Order',
+      render: (r) => <Link href={`/mis/bom/${r.orderId}`} className="mis-press inline-flex min-h-11 touch-manipulation items-center font-mono text-sm font-bold text-indigo-700 hover:underline whitespace-nowrap">{r.orderNumber}</Link>,
+    },
+    { key: 'bomNumber', header: 'BOM #', render: (r) => <span className="font-mono text-sm text-slate-700 whitespace-nowrap">{r.bomNumber ?? '—'}</span> },
+    { key: 'customer', header: 'Customer', render: (r) => <span className="text-slate-700">{r.customerName ?? 'No customer'}</span> },
+    {
+      key: 'description',
+      header: 'Specification',
+      render: (r) => <span title={r.description ?? undefined} className="block max-w-[10rem] truncate text-slate-700 md:max-w-xs">{r.description || '—'}</span>,
+    },
+    { key: 'due', header: 'Due date', render: (r) => <span className="font-mono text-sm text-slate-700 whitespace-nowrap">{r.deliveryDate ?? '—'}</span> },
+    { key: 'orderStatus', header: 'Order Status', render: (r) => <StatusBadge dot tone="neutral">{r.orderStatus.replace(/_/g, ' ')}</StatusBadge> },
+    { key: 'bomStatus', header: 'BOM Status', render: (r) => <StatusBadge dot tone={BOM_STATUS_TONE[r.bomStatus]}>{BOM_STATUS_LABEL[r.bomStatus]}</StatusBadge> },
+    { key: 'counts', header: 'Stages / Materials', render: (r) => <span className="text-sm text-slate-600">{r.stageCount} / {r.materialCount}</span> },
+    { key: 'cost', header: 'Est. Cost', render: (r) => <span className="font-mono text-sm">{r.estimatedCostLabel ?? '—'}</span> },
+    {
+      key: 'actions',
+      header: '',
+      render: (r) => {
+        const cta = CTA[r.bomStatus];
+        return (
+          <IconAction label={cta.label} href={`/mis/bom/${r.orderId}${cta.edit ? '?view=edit' : ''}`} icon={<cta.icon aria-hidden="true" className="size-5" />} />
+        );
+      },
+    },
+  ];
+
+  return (
+    <div className="flex w-full flex-col gap-4 text-slate-900">
+      <PageHeader title="Bill of Materials" className="mb-0" />
+      {counts && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4" aria-label="BOM pipeline summary">
+          {[
+            ['Active orders', counts.ALL, 'text-slate-900'],
+            ['Missing BOMs', counts.NO_BOM, counts.NO_BOM > 0 ? 'text-red-700' : 'text-slate-900'],
+            ['Drafts', counts.DRAFT, 'text-amber-800'],
+            ['Pending approval', counts.PENDING_APPROVAL, 'text-sky-800'],
+          ].map(([label, n, tone]) => (
+            <div key={label as string} className="mis-rise rounded-2xl border border-slate-200 bg-white p-3 shadow-card">
+              <div className="text-sm text-slate-600">{label}</div>
+              <div className={`text-2xl font-semibold ${tone}`}>{n}</div>
+            </div>
+          ))}
+        </div>
+      )}
+      {counts && paging && (
+        <nav aria-label="Filter by BOM status" className="flex flex-wrap gap-2">
+          {TABS.map((t) => {
+            const active = (status || 'ALL') === t.key;
+            return (
+              <Link
+                key={t.key}
+                href={pageHref('/mis/bom', { ...paging.params, status: t.key === 'ALL' ? undefined : t.key }, 1)}
+                aria-current={active ? 'page' : undefined}
+                className={`mis-press inline-flex min-h-12 touch-manipulation items-center rounded-xl border px-3 text-sm font-semibold ${active ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-slate-300 bg-white text-slate-900 hover:bg-slate-50'}`}
+              >
+                {t.label} ({counts[t.key]})
+              </Link>
+            );
+          })}
+        </nav>
+      )}
+      {paging && <ListToolbar basePath="/mis/bom" params={paging.params} searchLabel="Search orders or BOM #…" view={view} />}
+      <DataTable columns={columns} rows={rows} rowKey={(r) => r.orderId} view={view} emptyTitle="No active orders" emptyBody="Active orders will appear here once created." />
+      {paging && <Pagination basePath="/mis/bom" params={paging.params} page={paging.page} total={paging.total} />}
+    </div>
+  );
+}

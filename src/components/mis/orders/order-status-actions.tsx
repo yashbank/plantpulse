@@ -1,0 +1,209 @@
+'use client';
+import { useState, useTransition } from 'react';
+import { Button } from '@/components/mis/kit/button';
+import { Input } from '@/components/mis/kit/input';
+import { SlideOver } from '@/components/mis/kit/slide-over';
+import { updateOrderStatusAction } from '@/app/(mis)/mis/orders/actions';
+import { MIN_REASON_LENGTH, type CloseGate } from '@/lib/mis/order-transitions';
+import { fmtDateTime } from '@/lib/mis/client-dates';
+import { useToast } from '@/components/ui/toast';
+import { RowActions, type RowActionItem } from '@/components/mis/kit/row-actions';
+
+type Props = {
+  orderId: string;
+  orderNumber: string;
+  status: string;
+  /** Close gates, only fetched while the order can still be completed. */
+  gates: CloseGate[];
+  /** OWNER/ADMIN: may complete past unmet gates with a reason. */
+  canOverride: boolean;
+  /** R2-267: OWNER only — may start production without an approved BOM, with a reason. */
+  canStartWithoutBom?: boolean;
+  /** Last "completed past unmet gates" override, shown on the order. */
+  override: { reason: string; at: Date } | null;
+  /** 'inline' (default) = today's button row. 'menu' = one prominent primary button + a three-dot menu. */
+  layout?: 'inline' | 'menu';
+  /** Menu layout only: extra items (View, Edit) listed before "Cancel order". */
+  menuItems?: RowActionItem[];
+};
+
+type Panel = null | 'complete' | 'cancel' | 'start';
+
+/**
+ * Close / deliver / cancel an order. Shared by the phone detail screen and the D4 desktop twin
+ * so the two cannot drift. The caller renders it only for roles holding `orders.write`; the
+ * server re-checks everything (transition table, gates, override role).
+ *
+ * "Mark complete" is offered on IN_PRODUCTION only: the transition table has no
+ * CONFIRMED -> COMPLETED move, so a CONFIRMED order gets "Start production" instead.
+ */
+export function OrderStatusActions({ orderId, orderNumber, status, gates: initialGates, canOverride, override, canStartWithoutBom = false, layout = 'inline', menuItems = [] }: Props) {
+  // The server is the authority on the gates: a refusal carries the fresh list, which replaces
+  // what the page loaded (it may have gone stale) and reveals the override field.
+  const [freshGates, setFreshGates] = useState<CloseGate[] | null>(null);
+  const gates = freshGates ?? initialGates;
+  const [panel, setPanel] = useState<Panel>(null);
+  const [reason, setReason] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [pending, start] = useTransition();
+  const { toast } = useToast();
+  // R3 B104: what a cancel would drop (pending BOM, open material requests), from the server's refusal.
+  const [openItems, setOpenItems] = useState<string[]>([]);
+
+  const unmet = gates.filter((g) => !g.passed);
+  const reasonOk = reason.trim().length >= MIN_REASON_LENGTH;
+
+  const close = () => { setPanel(null); setFreshGates(null); setReason(''); setError(null); setOpenItems([]); };
+  const run = (next: string, why?: string, done?: () => void, confirmOpenItems?: boolean) => start(async () => {
+    setError(null);
+    try {
+      const result = await updateOrderStatusAction(orderId, next, why, confirmOpenItems);
+      if (result.ok) { (done ?? close)(); } else {
+        setError(result.detail);
+        toast('error', result.detail);
+        if (result.gates) setFreshGates(result.gates);
+        if (result.openItems) setOpenItems(result.openItems);
+        // R2-267: the Owner gets a reason box instead of a dead end when the BOM is not approved.
+        if (result.reason === 'BOM_NOT_APPROVED' && canStartWithoutBom && next === 'IN_PRODUCTION') setPanel('start');
+      }
+    } catch {
+      const detail = 'That did not save. Try again.';
+      setError(detail);
+      toast('error', detail);
+    }
+  });
+
+  const btn = 'inline-flex min-h-11 items-center rounded-lg border bg-white px-3 text-sm font-semibold hover:bg-slate-50';
+
+  const panels = (
+    <>
+      <SlideOver open={panel === 'start'} onClose={close} title="Start production without an approved BOM">
+        <div className="flex flex-col gap-4 p-4">
+          <p className="text-sm text-slate-600">{orderNumber}</p>
+          {error && <div role="alert" className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm font-semibold text-amber-900">{error}</div>}
+          <Input label="Reason (required, goes on the record)" value={reason} onChange={(e) => setReason(e.target.value)} />
+          <div className="flex gap-2 pt-2">
+            <Button onClick={() => run('IN_PRODUCTION', reason)} disabled={pending || !reasonOk}>Start anyway</Button>
+            <Button variant="ghost" onClick={close}>Cancel</Button>
+          </div>
+        </div>
+      </SlideOver>
+
+      <SlideOver open={panel === 'complete'} onClose={close} title="Mark complete">
+        <div className="flex flex-col gap-4 p-4">
+          <p className="text-sm text-slate-600">{orderNumber}</p>
+          <ul className="divide-y divide-slate-100 rounded-xl border border-slate-200">
+            {gates.map((g) => (
+              <li key={g.key} className="flex items-start gap-3 px-3 py-2.5 text-sm">
+                <span aria-hidden="true" className={g.passed ? 'font-bold text-green-700' : 'font-bold text-red-700'}>{g.passed ? '✓' : '✗'}</span>
+                <span className="min-w-0">
+                  <span className="block font-medium text-slate-900">{g.label} <span className="sr-only">{g.passed ? 'passed' : 'not met'}</span></span>
+                  {!g.passed && <span className="block text-xs text-red-700">{g.detail}</span>}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {unmet.length > 0 && (canOverride ? (
+            <Input label="Override reason (required to complete anyway)" value={reason} onChange={(e) => setReason(e.target.value)} />
+          ) : (
+            <p className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm font-semibold text-amber-900">
+              This order cannot be completed until the gates above are met. An owner or admin can override.
+            </p>
+          ))}
+          {error && <div role="alert" className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm font-semibold text-amber-900">{error}</div>}
+          <div className="flex gap-2 pt-2">
+            <Button
+              onClick={() => run('COMPLETED', unmet.length > 0 ? reason : undefined)}
+              disabled={pending || (unmet.length > 0 && (!canOverride || !reasonOk))}
+            >
+              {unmet.length > 0 ? 'Complete anyway' : 'Mark complete'}
+            </Button>
+            <Button variant="ghost" onClick={close}>Close</Button>
+          </div>
+        </div>
+      </SlideOver>
+
+      <SlideOver open={panel === 'cancel'} onClose={close} title="Cancel order">
+        <div className="flex flex-col gap-4 p-4">
+          <p className="text-sm text-slate-600">{orderNumber}</p>
+          <Input label="Why is this order being cancelled?" value={reason} onChange={(e) => setReason(e.target.value)} />
+          {openItems.length > 0 && (
+            <ul className="list-disc rounded-2xl border border-amber-200 bg-amber-50 p-3 pl-7 text-sm text-amber-900">
+              {openItems.map((item) => <li key={item}>{item}</li>)}
+            </ul>
+          )}
+          {error && <div role="alert" className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm font-semibold text-amber-900">{error}</div>}
+          <div className="flex gap-2 pt-2">
+            <Button variant="danger" onClick={() => run('CANCELLED', reason, undefined, openItems.length > 0)} disabled={pending || !reasonOk}>
+              {openItems.length > 0 ? 'Cancel anyway' : 'Cancel order'}
+            </Button>
+            <Button variant="ghost" onClick={close}>Keep order</Button>
+          </div>
+        </div>
+      </SlideOver>
+    </>
+  );
+
+  if (layout === 'menu') {
+    const pri = 'mis-action inline-flex min-h-11 items-center';
+    const canCancel = status === 'DRAFT' || status === 'CONFIRMED' || status === 'IN_PRODUCTION';
+    const items: RowActionItem[] = [
+      ...menuItems,
+      ...(canCancel ? [{ key: 'cancel', label: 'Cancel order', danger: true, onSelect: () => setPanel('cancel') }] : []),
+    ];
+    return (
+      <>
+        <div className="flex items-center justify-end gap-2">
+          {status === 'DRAFT' && (
+            <button type="button" disabled={pending} onClick={() => run('CONFIRMED', undefined, () => setError(null))} className={`${pri} mis-action-primary`}>Confirm</button>
+          )}
+          {status === 'CONFIRMED' && (
+            <button type="button" disabled={pending} onClick={() => run('IN_PRODUCTION', undefined, () => setError(null))} className={`${pri} mis-action-primary`}>Start production</button>
+          )}
+          {status === 'IN_PRODUCTION' && (
+            <button type="button" onClick={() => setPanel('complete')} className={`${pri} mis-action-go`}>Mark complete</button>
+          )}
+          {status === 'COMPLETED' && (
+            <button type="button" disabled={pending} onClick={() => run('DELIVERED', undefined, () => setError(null))} className={`${pri} mis-action-go`}>Mark delivered</button>
+          )}
+          <RowActions items={items} />
+        </div>
+        {error && panel === null && <p role="alert" className="basis-full text-sm font-semibold text-amber-900">{error}</p>}
+        {panels}
+      </>
+    );
+  }
+
+  return (
+    <>
+      {status === 'CONFIRMED' && (
+        <button type="button" disabled={pending} onClick={() => run('IN_PRODUCTION', undefined, () => setError(null))} className={`${btn} border-slate-300 text-slate-800`}>
+          Start production
+        </button>
+      )}
+      {status === 'IN_PRODUCTION' && (
+        <button type="button" onClick={() => setPanel('complete')} className={`${btn} border-green-300 text-green-900`}>
+          Mark complete
+        </button>
+      )}
+      {status === 'COMPLETED' && (
+        <button type="button" disabled={pending} onClick={() => run('DELIVERED', undefined, () => setError(null))} className={`${btn} border-green-300 text-green-900`}>
+          Mark delivered
+        </button>
+      )}
+      {(status === 'DRAFT' || status === 'CONFIRMED' || status === 'IN_PRODUCTION') && (
+        <button type="button" onClick={() => setPanel('cancel')} className={`${btn} border-red-300 text-red-800`}>
+          Cancel order
+        </button>
+      )}
+      {error && panel === null && <p role="alert" className="basis-full text-sm font-semibold text-amber-900">{error}</p>}
+      {override && (status === 'COMPLETED' || status === 'DELIVERED') && (
+        <p className="basis-full text-sm text-amber-800">
+          Completed past unmet gates on {fmtDateTime(override.at)}: {override.reason}
+        </p>
+      )}
+
+      {panels}
+    </>
+  );
+}

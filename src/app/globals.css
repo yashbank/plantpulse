@@ -1,0 +1,988 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+:root {
+  /* APM / Stitch — Tactile Executive (light) */
+  --apm-background: #faf9f9;
+  --apm-ivory: #f4f3f3;
+  --apm-surface: #ffffff;
+  --apm-surface-container: #efeded;
+  --apm-graphite: #1b1c1c;
+  --apm-muted: #5e5e5b;
+  --apm-outline: #c4c7c7;
+  --radius: 0.75rem;
+  --background: var(--apm-background);
+  --foreground: var(--apm-graphite);
+  --card: var(--apm-surface);
+  --card-foreground: var(--apm-graphite);
+  --popover: var(--apm-surface);
+  --popover-foreground: var(--apm-graphite);
+  --primary: #4f46e5;
+  --primary-foreground: #ffffff;
+  --secondary: var(--apm-ivory);
+  --secondary-foreground: var(--apm-graphite);
+  --muted: var(--apm-ivory);
+  --muted-foreground: var(--apm-muted);
+  --accent: var(--apm-surface-container);
+  --accent-foreground: var(--apm-graphite);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.577 0.245 27.325);
+  --border: color-mix(in oklab, var(--apm-outline) 55%, transparent);
+  --input: var(--apm-outline);
+  --ring: #6366f1;
+  --shadow-card: 0 1px 2px rgb(27 28 28 / 0.04), 0 1px 3px rgb(27 28 28 / 0.03);
+  --shadow-elevated: 0 4px 16px rgb(27 28 28 / 0.06), 0 1px 3px rgb(27 28 28 / 0.04);
+  --shadow-float: 0 12px 40px rgb(27 28 28 / 0.1), 0 4px 12px rgb(27 28 28 / 0.05);
+}
+
+.dark {
+  --apm-background: #141414;
+  --apm-ivory: #1c1c1c;
+  --apm-surface: #1a1a1a;
+  --apm-surface-container: #262626;
+  --apm-graphite: #f2f0f0;
+  --apm-muted: #a3a3a3;
+  --apm-outline: #3a3a3a;
+  --background: var(--apm-background);
+  --foreground: var(--apm-graphite);
+  --card: var(--apm-surface);
+  --card-foreground: var(--apm-graphite);
+  --popover: var(--apm-surface);
+  --popover-foreground: var(--apm-graphite);
+  --primary: #6366f1;
+  --primary-foreground: #ffffff;
+  --secondary: var(--apm-ivory);
+  --secondary-foreground: var(--apm-graphite);
+  --muted: var(--apm-ivory);
+  --muted-foreground: var(--apm-muted);
+  --accent: var(--apm-surface-container);
+  --accent-foreground: var(--apm-graphite);
+  --destructive: oklch(0.396 0.141 25.723);
+  --destructive-foreground: oklch(0.637 0.237 25.331);
+  --border: oklch(0.24 0 0);
+  --input: oklch(0.24 0 0);
+  --ring: #818cf8;
+  --shadow-card: 0 1px 3px oklch(0 0 0 / 0.2), 0 1px 2px oklch(0 0 0 / 0.12);
+  --shadow-elevated: 0 3px 12px oklch(0 0 0 / 0.25), 0 1px 3px oklch(0 0 0 / 0.15);
+  --shadow-float: 0 12px 40px oklch(0 0 0 / 0.35), 0 4px 12px oklch(0 0 0 / 0.2);
+}
+
+
+/*
+ * MIS is a light-only product (docs/MIS_UI_SPEC.md has no dark mode). Its screens hard-code
+ * white cards, so a phone/OS in dark mode must not turn the inherited text near-white. The
+ * MisShell renders <div class="mis-light">; these two rules re-declare the light tokens for
+ * that subtree (.mis-light) and for <html> itself while an MIS screen is mounted
+ * (html:has(...)), which also covers portalled dialogs/menus and the page background.
+ * Two rules, not one list: a browser without :has() must not drop the whole declaration.
+ * The legacy (dashboard)/(auth) UI never renders .mis-light and keeps its dark mode.
+ */
+.mis-light {
+  color-scheme: light;
+  /* APM / Stitch — Tactile Executive (light) */
+  --apm-background: #faf9f9;
+  --apm-ivory: #f4f3f3;
+  --apm-surface: #ffffff;
+  --apm-surface-container: #efeded;
+  --apm-graphite: #1b1c1c;
+  --apm-muted: #5e5e5b;
+  --apm-outline: #c4c7c7;
+  --radius: 0.75rem;
+  --background: var(--apm-background);
+  --foreground: var(--apm-graphite);
+  --card: var(--apm-surface);
+  --card-foreground: var(--apm-graphite);
+  --popover: var(--apm-surface);
+  --popover-foreground: var(--apm-graphite);
+  --primary: #4f46e5;
+  --primary-foreground: #ffffff;
+  --secondary: var(--apm-ivory);
+  --secondary-foreground: var(--apm-graphite);
+  --muted: var(--apm-ivory);
+  --muted-foreground: var(--apm-muted);
+  --accent: var(--apm-surface-container);
+  --accent-foreground: var(--apm-graphite);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.577 0.245 27.325);
+  --border: color-mix(in oklab, var(--apm-outline) 55%, transparent);
+  --input: var(--apm-outline);
+  --ring: #6366f1;
+  --shadow-card: 0 1px 2px rgb(27 28 28 / 0.04), 0 1px 3px rgb(27 28 28 / 0.03);
+  --shadow-elevated: 0 4px 16px rgb(27 28 28 / 0.06), 0 1px 3px rgb(27 28 28 / 0.04);
+  --shadow-float: 0 12px 40px rgb(27 28 28 / 0.1), 0 4px 12px rgb(27 28 28 / 0.05);
+  background-color: var(--background);
+  color: var(--color-slate-900, #0f172a);
+}
+html:has(.mis-light) {
+  color-scheme: light;
+  /* APM / Stitch — Tactile Executive (light) */
+  --apm-background: #faf9f9;
+  --apm-ivory: #f4f3f3;
+  --apm-surface: #ffffff;
+  --apm-surface-container: #efeded;
+  --apm-graphite: #1b1c1c;
+  --apm-muted: #5e5e5b;
+  --apm-outline: #c4c7c7;
+  --radius: 0.75rem;
+  --background: var(--apm-background);
+  --foreground: var(--apm-graphite);
+  --card: var(--apm-surface);
+  --card-foreground: var(--apm-graphite);
+  --popover: var(--apm-surface);
+  --popover-foreground: var(--apm-graphite);
+  --primary: #4f46e5;
+  --primary-foreground: #ffffff;
+  --secondary: var(--apm-ivory);
+  --secondary-foreground: var(--apm-graphite);
+  --muted: var(--apm-ivory);
+  --muted-foreground: var(--apm-muted);
+  --accent: var(--apm-surface-container);
+  --accent-foreground: var(--apm-graphite);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.577 0.245 27.325);
+  --border: color-mix(in oklab, var(--apm-outline) 55%, transparent);
+  --input: var(--apm-outline);
+  --ring: #6366f1;
+  --shadow-card: 0 1px 2px rgb(27 28 28 / 0.04), 0 1px 3px rgb(27 28 28 / 0.03);
+  --shadow-elevated: 0 4px 16px rgb(27 28 28 / 0.06), 0 1px 3px rgb(27 28 28 / 0.04);
+  --shadow-float: 0 12px 40px rgb(27 28 28 / 0.1), 0 4px 12px rgb(27 28 28 / 0.05);
+}
+html.dark:has(.mis-light) .bg-shimmer {
+  background: linear-gradient(90deg, var(--muted) 0%, oklch(0.975 0 0) 40%, oklch(0.975 0 0) 60%, var(--muted) 100%);
+}
+html.dark:has(.mis-light) .glass {
+  background: oklch(1 0 0 / 0.7);
+}
+
+/*
+ * WCAG AA: text-slate-400 / gray-400 / gray-300 are ~2.5:1 on white. On MIS screens read them
+ * as slate-500 (4.76:1). Only the text colour utilities are touched (not border-*, bg-*, or
+ * placeholder:/hover: variants). Light-on-dark surfaces (the #171310 panels, dark buttons) keep
+ * the original light grey.
+ */
+html:has(.mis-light) :is(.text-slate-400, .text-gray-400, .text-gray-300):not(
+    :is([class*="bg-[#171310]"], [class*="bg-slate-900"], [class*="bg-slate-800"], [class*="bg-gray-900"]),
+    :is([class*="bg-[#171310]"], [class*="bg-slate-900"], [class*="bg-slate-800"], [class*="bg-gray-900"]) *
+  ) {
+  color: var(--color-slate-500, #64748b);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: 'rlig' 1, 'calt' 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* --- Animations --- */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes slide-in-from-bottom-2 {
+  from { transform: translateY(0.5rem); }
+  to { transform: translateY(0); }
+}
+@keyframes zoom-in-95 {
+  from { transform: scale(0.95); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+@keyframes slide-in-from-right-4 {
+  from { transform: translateX(1rem); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes slide-up-fade {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.97); }
+  to   { opacity: 1; transform: scale(1); }
+}
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes content-reveal {
+  from { opacity: 0; transform: translateY(8px) scale(0.995); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes drawer-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes menu-in {
+  from { opacity: 0; transform: scale(0.96) translateY(-2px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes dialog-in {
+  from { opacity: 0; transform: scale(0.97); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+@keyframes draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes gradient-pan {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+.animate-gradient-pan {
+  background-size: 200% 200%;
+  animation: gradient-pan 6s ease infinite;
+}
+
+.animate-in {
+  animation-fill-mode: both;
+}
+.fade-in { animation-name: fade-in; }
+.slide-in-from-bottom-2 { animation-name: slide-in-from-bottom-2; }
+.slide-in-from-right-4 { animation-name: slide-in-from-right-4; }
+.slide-up-fade { animation-name: slide-up-fade; }
+.scale-in { animation-name: scale-in; }
+.zoom-in-95 { animation-name: zoom-in-95; }
+.content-reveal { animation-name: content-reveal; }
+.drawer-in { animation-name: drawer-in; }
+.menu-in { animation-name: menu-in; }
+.dialog-in { animation-name: dialog-in; }
+.duration-100 { animation-duration: 100ms; }
+.duration-150 { animation-duration: 150ms; }
+.duration-200 { animation-duration: 200ms; }
+.duration-250 { animation-duration: 250ms; }
+.duration-300 { animation-duration: 300ms; }
+.duration-400 { animation-duration: 400ms; }
+.duration-500 { animation-duration: 500ms; }
+.duration-600 { animation-duration: 600ms; }
+
+/* --- Shimmer loading --- */
+.bg-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--muted) 0%,
+    oklch(0.975 0 0) 40%,
+    oklch(0.975 0 0) 60%,
+    var(--muted) 100%
+  );
+}
+.dark .bg-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--muted) 0%,
+    oklch(0.28 0 0) 40%,
+    oklch(0.28 0 0) 60%,
+    var(--muted) 100%
+  );
+}
+.animate-shimmer {
+  background-size: 200% 100%;
+  animation: shimmer 1.8s ease-in-out infinite;
+}
+
+/* --- Utility classes --- */
+.scrollbar-none::-webkit-scrollbar { display: none; }
+.scrollbar-none { -ms-overflow-style: none; scrollbar-width: none; }
+
+.shadow-card { box-shadow: var(--shadow-card); }
+.shadow-elevated { box-shadow: var(--shadow-elevated); }
+.shadow-float { box-shadow: var(--shadow-float); }
+
+/* Card hover motion: lift + elevated shadow. Opt in with .hover-lift on any clickable card. */
+.hover-lift { transition: transform 150ms ease-out, box-shadow 150ms ease-out; }
+.hover-lift:hover { transform: translateY(-2px); box-shadow: var(--shadow-elevated); }
+@media (prefers-reduced-motion: reduce) {
+  .hover-lift, .hover-lift:hover { transition: none; transform: none; }
+  .animate-shimmer { animation: none; }
+}
+
+/* APM paper surfaces */
+@layer components {
+  .apm-card {
+    @apply rounded-2xl border border-border/60 bg-card;
+    box-shadow: var(--shadow-card);
+  }
+  .apm-card-interactive {
+    @apply rounded-2xl border border-border/60 bg-card transition-[box-shadow,transform] duration-200;
+    box-shadow: var(--shadow-card);
+  }
+  .apm-card-interactive:hover {
+    box-shadow: var(--shadow-elevated);
+  }
+  .apm-label-caps {
+    @apply text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/55;
+  }
+  .apm-page-title {
+    @apply text-2xl font-semibold tracking-tight;
+    background-image: linear-gradient(100deg, var(--foreground) 30%, var(--primary) 115%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}
+.bg-checkerboard {
+  background-image:
+    linear-gradient(45deg, var(--muted) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--muted) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--muted) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--muted) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+}
+
+.glass {
+  background: oklch(1 0 0 / 0.7);
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+}
+.dark .glass {
+  background: oklch(0.155 0 0 / 0.75);
+}
+
+.apm-safe-bottom {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom, 0px));
+}
+
+/* --- Respect the user's reduced-motion preference --- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* Stop the shimmer sweep but keep the static muted fill (.bg-shimmer) so
+     loading is still clearly indicated. */
+  .animate-shimmer {
+    animation: none !important;
+  }
+}
+
+/* ── MIS premium layer (pilot, hover effects now pointer-only): row menu, primary action, card lift, entrance ──────────────
+ * Additive and scoped to .mis-light. Tokens only (Tailwind theme colours); no new hex.
+ * Every animation is switched off by the reduced-motion block at the end of this section. */
+@keyframes mis-menu-item-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+/* Transform only: an opacity-0 start hides content from the browser's first-paint timer (measured +250 ms FCP). */
+@keyframes mis-rise-in {
+  from { transform: translateY(8px); }
+  to { transform: translateY(0); }
+}
+.mis-menu-item { animation: mis-menu-item-in 160ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+.mis-menu-item .mis-menu-icon { transition: transform 150ms ease; }
+.mis-menu-item:focus-visible .mis-menu-icon { transform: scale(1.12); }
+@media (hover: hover) { .mis-menu-item:hover .mis-menu-icon { transform: scale(1.12); } }
+
+.mis-row-trigger {
+  display: inline-flex; height: 2.75rem; width: 2.75rem; flex-shrink: 0; align-items: center; justify-content: center;
+  border-radius: 0.75rem; color: var(--color-slate-500);
+  transition: background-color 150ms ease, color 150ms ease, transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 150ms ease;
+}
+@media (hover: hover) { .mis-row-trigger:hover { background-color: var(--color-indigo-50); color: var(--color-indigo-700); } }
+.mis-row-trigger { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.mis-row-trigger:active { background-color: var(--mis-press-tint, color-mix(in oklab, var(--color-indigo-600) 10%, transparent)); }
+.mis-row-trigger:focus-visible { outline: 2px solid var(--color-indigo-600); outline-offset: 2px; }
+.mis-row-trigger.is-open { background-color: var(--color-indigo-100); color: var(--color-indigo-800); transform: rotate(90deg); box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-indigo-500) 18%, transparent); }
+/* On a pointer device the trigger is a quiet ghost until the row is hovered or focused. */
+@media (hover: hover) {
+  .mis-light tr:not(:hover):not(:focus-within) .mis-row-trigger:not(.is-open) { color: var(--color-slate-400); }
+}
+
+.mis-light .mis-action {
+  display: inline-flex; min-height: 2.75rem; align-items: center; gap: 0.375rem; border-radius: 0.75rem;
+  padding: 0 0.875rem; font-size: 0.875rem; font-weight: 600; border: 1px solid transparent; white-space: nowrap;
+  transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 180ms ease, background-color 150ms ease, color 150ms ease;
+}
+.mis-light .mis-action { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+@media (hover: hover) { .mis-light .mis-action:hover:not(:disabled) { transform: translateY(-1px); box-shadow: var(--shadow-elevated); } }
+.mis-light .mis-action:active:not(:disabled) { transform: scale(var(--mis-press-scale, 0.98)); box-shadow: none; }
+.mis-light .mis-action:disabled { opacity: 0.55; cursor: not-allowed; }
+.mis-light .mis-action:focus-visible { outline: 2px solid var(--color-indigo-600); outline-offset: 2px; }
+.mis-light .mis-action-go { background-image: linear-gradient(135deg, var(--color-emerald-600), var(--color-emerald-700)); color: var(--color-white); }
+.mis-light .mis-action-primary { background-image: linear-gradient(135deg, var(--color-indigo-500), var(--color-indigo-700)); color: var(--color-white); }
+.mis-light .mis-action-quiet { background-color: var(--color-white); border-color: var(--color-slate-300); color: var(--color-slate-800); }
+@media (hover: hover) { .mis-light .mis-action-quiet:hover:not(:disabled) { background-color: var(--color-slate-50); } }
+
+.mis-light .mis-lift { transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 220ms ease, border-color 220ms ease; }
+@media (hover: hover) { .mis-light .mis-lift:hover { transform: translateY(-2px); box-shadow: var(--shadow-float); border-color: color-mix(in oklab, var(--color-indigo-500) 35%, transparent); } }
+.mis-light .mis-rise { animation: mis-rise-in 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+.mis-light .mis-rise:nth-child(2) { animation-delay: 30ms; }
+.mis-light .mis-rise:nth-child(3) { animation-delay: 60ms; }
+.mis-light .mis-rise:nth-child(4) { animation-delay: 90ms; }
+.mis-light .mis-rise:nth-child(5) { animation-delay: 120ms; }
+.mis-light .mis-rise:nth-child(n + 6) { animation-delay: 120ms; }
+.mis-light tbody tr { transition: background-color 150ms ease; }
+@media (hover: hover) { .mis-light tbody tr:hover { background-color: color-mix(in oklab, var(--color-indigo-500) 4%, transparent); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .mis-menu-item, .mis-light .mis-rise { animation: none; }
+  .mis-row-trigger, .mis-row-trigger.is-open, .mis-light .mis-action, .mis-light .mis-lift,
+  .mis-menu-item .mis-menu-icon { transition: none; transform: none; }
+  .mis-light .mis-lift:hover, .mis-light .mis-action:hover:not(:disabled), .mis-light .mis-action:active:not(:disabled) { transform: none; }
+}
+
+/* ── MIS premium kit foundation (docs/premium-ui/design-spec.md, KIT.md) ──────────────────
+ * Tokens (--mis-*) are declared on .mis-light AND html:has(.mis-light) so portalled menus/dialogs
+ * see them too. Every rule below that moves something is transform/opacity only, hover effects sit
+ * in @media (hover:hover), and the reduced-motion block at the end of this section turns it all off.
+ * Adapted from React Bits (https://reactbits.dev) - MIT + Commons Clause, (c) 2026 David Haz:
+ * the spotlight glow and gradient title ideas (re-implemented as plain CSS). */
+.mis-light, html:has(.mis-light) {
+  /* 1. Surfaces (page < card < raised < hero) */
+  --mis-page: var(--color-slate-50);
+  --mis-page-wash: radial-gradient(60rem 28rem at 12% -8%, color-mix(in oklab, var(--color-indigo-500) 8%, transparent), transparent 70%),
+                   radial-gradient(44rem 24rem at 100% 0%, color-mix(in oklab, var(--color-sky-400) 7%, transparent), transparent 70%);
+  --mis-card: var(--color-white);
+  --mis-card-quiet: color-mix(in oklab, var(--color-white) 70%, var(--color-slate-50));
+  --mis-raised: var(--color-white);
+  --mis-hero: linear-gradient(135deg, var(--color-indigo-600), var(--color-indigo-800));
+  --mis-hero-ink: var(--color-white);
+  --mis-overlay: color-mix(in oklab, var(--color-slate-900) 40%, transparent);
+
+  /* Borders, glow, rings */
+  --mis-border: var(--color-slate-200);
+  --mis-border-strong: var(--color-slate-300);
+  --mis-border-hover: color-mix(in oklab, var(--color-indigo-500) 35%, transparent);
+  --mis-glow: 0 0 0 4px color-mix(in oklab, var(--color-indigo-500) 14%, transparent);
+  --mis-ring: var(--color-indigo-600);
+  --mis-hairline: inset 0 1px 0 color-mix(in oklab, var(--color-white) 70%, transparent);
+
+  /* Elevation (existing --shadow-card/-elevated/-float stay; aliases only) */
+  --mis-shadow-0: none;
+  --mis-shadow-1: var(--shadow-card);
+  --mis-shadow-2: var(--shadow-elevated);
+  --mis-shadow-3: var(--shadow-float);
+
+  /* Radii */
+  --mis-r-chip: 9999px;
+  --mis-r-control: 0.75rem;   /* buttons, inputs: 12px */
+  --mis-r-card: 1rem;         /* cards: 16px */
+  --mis-r-hero: 1.25rem;      /* hero, slide-over: 20px */
+
+  /* 2. Colour roles: fg (AA on its bg), bg tint, line */
+  --mis-primary: var(--color-indigo-600);       --mis-primary-hover: var(--color-indigo-700);
+  --mis-primary-bg: var(--color-indigo-50);     --mis-primary-line: var(--color-indigo-200);
+  --mis-success: var(--color-emerald-700);      --mis-success-bg: var(--color-emerald-50);  --mis-success-line: var(--color-emerald-200);
+  --mis-warning: var(--color-amber-900);        --mis-warning-bg: var(--color-amber-50);    --mis-warning-line: var(--color-amber-200);
+  --mis-danger: var(--color-red-700);           --mis-danger-bg: var(--color-red-50);       --mis-danger-line: var(--color-red-200);
+  --mis-info: var(--color-sky-800);             --mis-info-bg: var(--color-sky-50);         --mis-info-line: var(--color-sky-200);
+  --mis-money: var(--color-indigo-800);         --mis-money-bg: var(--color-indigo-50);     /* OWNER-only values */
+  --mis-ink: var(--color-slate-900);
+  --mis-ink-2: var(--color-slate-600);          /* 7:1 on white */
+  --mis-ink-3: var(--color-slate-500);          /* 4.8:1, labels only >= 12px */
+  /* Module accents: dot/chip glyph ONLY, text stays --mis-ink. Chip bg = -100, dot = -500. */
+  --mis-mod-production: var(--color-indigo-500);  --mis-mod-production-bg: var(--color-indigo-100);
+  --mis-mod-quality: var(--color-emerald-500);    --mis-mod-quality-bg: var(--color-emerald-100);
+  --mis-mod-store: var(--color-amber-500);        --mis-mod-store-bg: var(--color-amber-100);
+  --mis-mod-people: var(--color-sky-500);         --mis-mod-people-bg: var(--color-sky-100);
+  --mis-mod-purchasing: var(--color-violet-500);  --mis-mod-purchasing-bg: var(--color-violet-100);
+
+  /* 3. Type (font-sans Geist, font-mono Geist Mono) */
+  --mis-fs-display: 2.25rem;  --mis-fs-h1: 1.5rem;  --mis-fs-h2: 1.125rem;
+  --mis-fs-body: 1rem;        --mis-fs-small: 0.875rem; --mis-fs-label: 0.6875rem;
+  --mis-fw-display: 700;  --mis-fw-heading: 650;  --mis-fw-body: 400;  --mis-fw-label: 600;
+  --mis-tracking-tight: -0.02em;  --mis-tracking-label: 0.06em;
+  --mis-num: tabular-nums;
+
+  /* 4. Motion: one curve, four durations */
+  --mis-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --mis-d-fast: 120ms;   /* press, tint, colour */
+  --mis-d-base: 180ms;   /* hover, menu, toast */
+  --mis-d-slow: 260ms;   /* slide-over, sheet, lift */
+  --mis-d-enter: 380ms;  /* page enter, hero */
+  --mis-stagger: 40ms;   /* per child, max 6 steps */
+  --mis-press-scale: 0.98;
+  --mis-tap-min: 2.75rem; /* 44px */
+  --mis-press-tint: color-mix(in oklab, var(--color-indigo-600) 10%, transparent);
+  --mis-shimmer-base: var(--color-slate-100);
+  --mis-shimmer-peak: var(--color-slate-50);
+}
+
+@keyframes mis-page-in { from { transform: translateY(6px); } to { transform: none; } }
+@keyframes mis-progress { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+@keyframes mis-shimmer-x { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+@keyframes mis-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes mis-slide-x { from { transform: translateX(100%); } to { transform: none; } }
+@keyframes mis-slide-y { from { transform: translateY(100%); } to { transform: none; } }
+
+/* Page enter: put on <main>. */
+.mis-page-enter { animation: mis-page-in var(--mis-d-enter, 380ms) var(--mis-ease, cubic-bezier(0.2, 0.8, 0.2, 1)) both; }
+
+/* Touch press: scale + tint, pure :active (no JS). Add to any tappable card/row/button. */
+.mis-press { touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  transition: transform var(--mis-d-fast, 120ms) var(--mis-ease, ease-out), box-shadow var(--mis-d-fast, 120ms) var(--mis-ease, ease-out); }
+.mis-press:active:not(:disabled) { transform: scale(var(--mis-press-scale, 0.98)); box-shadow: inset 0 0 0 999px var(--mis-press-tint, color-mix(in oklab, var(--color-indigo-600) 10%, transparent)); }
+
+/* Ripple (CSS only): a radial glow grows from the centre while pressed. Needs relative + overflow-hidden. */
+.mis-ripple { position: relative; overflow: hidden; isolation: isolate; }
+.mis-ripple::after { content: ''; position: absolute; inset: 0; z-index: -1; pointer-events: none; opacity: 0; transform: scale(0);
+  border-radius: inherit; background: radial-gradient(circle at center, var(--mis-ripple, color-mix(in oklab, var(--color-indigo-600) 10%, transparent)) 0 60%, transparent 61%);
+  transition: transform var(--mis-d-slow, 260ms) var(--mis-ease, ease-out), opacity var(--mis-d-slow, 260ms) var(--mis-ease, ease-out); }
+.mis-ripple:active:not(:disabled)::after { opacity: 1; transform: scale(1.6); }
+.mis-ripple-fill { --mis-ripple: color-mix(in oklab, var(--color-white) 25%, transparent); }
+
+/* Sheen on primary buttons: one soft diagonal sweep on hover, pointer devices only. */
+.mis-sheen { position: relative; overflow: hidden; }
+.mis-sheen::before { content: ''; position: absolute; inset: 0; pointer-events: none; transform: translateX(-120%);
+  background: linear-gradient(100deg, transparent 30%, color-mix(in oklab, var(--color-white) 28%, transparent) 50%, transparent 70%); }
+@media (hover: hover) {
+  .mis-sheen:hover:not(:disabled)::before { transform: translateX(120%); transition: transform 600ms var(--mis-ease, ease-out); }
+}
+
+/* Spotlight card glow: pointer devices only. --mx/--my are set by kit/spotlight-card.tsx. */
+.mis-spot { position: relative; overflow: hidden; }
+.mis-spot::before { content: ''; position: absolute; inset: 0; pointer-events: none; opacity: 0; border-radius: inherit;
+  background: radial-gradient(18rem circle at var(--mx, 50%) var(--my, 50%), color-mix(in oklab, var(--color-indigo-500) 12%, transparent), transparent 65%);
+  transition: opacity var(--mis-d-base, 180ms) var(--mis-ease, ease-out); }
+@media (hover: hover) { .mis-spot[data-spot]:hover::before { opacity: 1; } }
+
+/* Lists: only the first viewport is painted for long lists. Not applied to <tr> (table rows ignore it). */
+.mis-cv { content-visibility: auto; contain-intrinsic-size: auto 96px; }
+
+/* Page wash: static gradient + tiny SVG noise (<1 KB). No animation, no blur. */
+.mis-wash { background-color: var(--mis-page, var(--color-slate-50));
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.035'/%3E%3C/svg%3E"), var(--mis-page-wash, none); }
+@media (prefers-reduced-data: reduce) { .mis-wash { background-image: none; } }
+
+/* Gradient page title (use sparingly: one per screen). Static, no animation. */
+.mis-gradient-text { background-image: linear-gradient(100deg, var(--color-slate-900) 40%, var(--color-indigo-700) 120%);
+  -webkit-background-clip: text; background-clip: text; color: transparent; }
+
+/* Route progress bar (kit/route-progress.tsx). */
+.mis-progress { position: fixed; top: 0; left: 0; right: 0; z-index: 60; height: 2px; overflow: hidden; pointer-events: none;
+  animation: mis-fade var(--mis-d-base, 180ms) linear both; }
+.mis-progress > i { display: block; height: 100%; width: 100%; background: var(--mis-ring, var(--color-indigo-600)); will-change: transform; animation: mis-progress 900ms linear infinite; }
+
+/* Skeleton: transform-only sweep (replaces the background-position shimmer). */
+.mis-skeleton { position: relative; overflow: hidden; background-color: var(--mis-shimmer-base, var(--color-slate-100)); }
+.mis-skeleton::after { content: ''; position: absolute; inset: 0; transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, var(--mis-shimmer-peak, var(--color-slate-50)), transparent);
+  animation: mis-shimmer-x 1.4s linear infinite; }
+
+/* Slide-over enter. */
+.mis-slide-x { animation: mis-slide-x var(--mis-d-slow, 260ms) var(--mis-ease, ease-out) both; }
+.mis-slide-y { animation: mis-slide-y var(--mis-d-slow, 260ms) var(--mis-ease, ease-out) both; }
+.mis-fade { animation: mis-fade var(--mis-d-slow, 260ms) linear both; }
+
+/* Touch press tint for table rows (rows cannot scale). */
+.mis-light tbody tr[class*="cursor-pointer"]:active { background-color: var(--mis-press-tint, color-mix(in oklab, var(--color-indigo-600) 10%, transparent)); }
+
+@media (prefers-reduced-motion: reduce) {
+  .mis-light, html:has(.mis-light) { --mis-d-fast: 0ms; --mis-d-base: 0ms; --mis-d-slow: 0ms; --mis-d-enter: 0ms; --mis-stagger: 0ms; --mis-press-scale: 1; }
+  .mis-page-enter, .mis-fade, .mis-slide-x, .mis-slide-y, .mis-progress { animation: none; }
+  .mis-progress > i { animation: none; transform: none; will-change: auto; }
+  .mis-skeleton::after { animation: none; transform: none; opacity: 0; }
+  .mis-press, .mis-ripple::after, .mis-sheen::before, .mis-spot::before { transition: none; }
+  .mis-press:active:not(:disabled), .mis-ripple:active:not(:disabled)::after { transform: none; }
+  .mis-sheen:hover:not(:disabled)::before { transform: translateX(-120%); }
+}
+
+/* ── MIS premium polish v2: elevation, radii, spacing, hover/press, sidebar ───────────────
+ * Light-only, scoped to .mis-light. CSS only. Hover under (hover:hover); transform/opacity/
+ * box-shadow only; off under reduced motion. Entry animation stays transform-only (never opacity 0). */
+.mis-light, html:has(.mis-light) {
+  /* Elevation scale: layered, cool slate-ink tint, hairline top highlight on the resting card. */
+  --shadow-card: 0 1px 2px rgb(15 23 42 / 0.04), 0 2px 8px -2px rgb(30 41 90 / 0.07), inset 0 1px 0 rgb(255 255 255 / 0.7);
+  --shadow-elevated: 0 2px 4px rgb(15 23 42 / 0.04), 0 10px 24px -8px rgb(30 41 90 / 0.14);
+  --shadow-float: 0 4px 8px rgb(15 23 42 / 0.05), 0 20px 44px -14px rgb(30 41 90 / 0.22);
+  --mis-border-hover: color-mix(in oklab, var(--color-indigo-500) 40%, var(--color-slate-200));
+  /* Spacing scale (4/8/12/16/24/32): page gutter and section rhythm. */
+  --mis-s-1: 0.25rem; --mis-s-2: 0.5rem; --mis-s-3: 0.75rem; --mis-s-4: 1rem; --mis-s-6: 1.5rem; --mis-s-8: 2rem;
+  --mis-gutter: var(--mis-s-4);
+}
+@media (min-width: 768px) { .mis-light, html:has(.mis-light) { --mis-gutter: var(--mis-s-6); } }
+@media (min-width: 1280px) { .mis-light, html:has(.mis-light) { --mis-gutter: var(--mis-s-8); } }
+@media (max-width: 359px) { .mis-light, html:has(.mis-light) { --mis-gutter: var(--mis-s-3); } }
+/* Phone/tablet frame: gutter follows the scale (16 phone, 24 tablet, 12 at <360). */
+.mis-light .mis-gutter { padding-inline: var(--mis-gutter); }
+@media (min-width: 768px) { .mis-light .mis-gutter { padding-top: var(--mis-s-6); } }
+
+/* Radius scale: cards 16px (neutral Card keeps rounded-xl in its class string for tests). */
+.mis-light .mis-card { border-radius: var(--mis-r-card); }
+.mis-light .mis-card[class*="rounded-[1.25rem]"] { border-radius: var(--mis-r-hero); }
+.mis-light .mis-card { transition: border-color var(--mis-d-base) var(--mis-ease), box-shadow var(--mis-d-base) var(--mis-ease), background-color var(--mis-d-base) var(--mis-ease), transform var(--mis-d-fast) var(--mis-ease); }
+@media (hover: hover) {
+  .mis-light .mis-card.mis-press:hover { border-color: var(--mis-border-hover); box-shadow: var(--shadow-card); }
+}
+
+/* Controls: 12px radius, crisper border, tinted on hover, refined focus ring. */
+.mis-light :is(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"]), select, textarea) {
+  border-radius: var(--mis-r-control);
+  transition: border-color var(--mis-d-base) var(--mis-ease), box-shadow var(--mis-d-base) var(--mis-ease);
+}
+@media (hover: hover) {
+  .mis-light :is(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"]), select, textarea):hover:not(:focus):not(:disabled) { border-color: var(--mis-border-hover); }
+}
+.mis-light :is(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"]), select, textarea):focus-visible {
+  outline: 2px solid var(--mis-ring); outline-offset: 0; border-color: var(--mis-ring); box-shadow: var(--mis-glow);
+}
+
+/* Buttons: smoother hover lift, press resets it. */
+.mis-light button.mis-ripple { transition-timing-function: var(--mis-ease); transition-duration: var(--mis-d-base); }
+@media (hover: hover) {
+  .mis-light button.mis-ripple:hover:not(:disabled) { transform: translateY(-1px); box-shadow: var(--shadow-elevated); }
+}
+.mis-light button.mis-ripple:active:not(:disabled) { transform: none; box-shadow: none; }
+.mis-light :is(a, button, [role="tab"], summary):focus-visible { outline-offset: 2px; }
+
+/* Tables: header tint, hairline dividers, no rule under the last row. */
+.mis-light thead tr { border-bottom-color: var(--mis-border-strong); }
+.mis-light thead th { background-color: color-mix(in oklab, var(--color-slate-50) 80%, var(--color-white)); font-weight: 600; letter-spacing: 0.01em; }
+.mis-light tbody tr { border-bottom-color: color-mix(in oklab, var(--color-slate-200) 70%, transparent); }
+.mis-light tbody tr:last-child { border-bottom-color: transparent; }
+
+/* Desktop sidebar: smooth tint, icon nudge on hover, active bar sits flush. */
+.mis-light .mis-nav-item { transition: background-color var(--mis-d-fast) var(--mis-ease), color var(--mis-d-fast) var(--mis-ease), box-shadow var(--mis-d-base) var(--mis-ease); }
+.mis-light .mis-nav-icon { transition: transform var(--mis-d-base) var(--mis-ease); }
+@media (hover: hover) { .mis-light .mis-nav-item:hover .mis-nav-icon { transform: scale(1.08); } }
+.mis-light .mis-nav-item:active .mis-nav-icon { transform: scale(0.94); }
+
+@media (prefers-reduced-motion: reduce) {
+  .mis-light button.mis-ripple:hover:not(:disabled), .mis-light .mis-nav-item:hover .mis-nav-icon, .mis-light .mis-nav-item:active .mis-nav-icon { transform: none; }
+  .mis-light .mis-card, .mis-light .mis-nav-item, .mis-light .mis-nav-icon { transition: none; }
+}
+
+/* premium v3: widgets */
+/* Dashboard widgets + role home cards: per-module accent, layered depth, glossy top edge, coloured glow,
+ * gradient icon plates and bars. Light only, CSS only, no new hex (var(--color-*) tokens). Colour never carries
+ * meaning alone: text/labels are unchanged. Tilt: pointer:fine + hover only. Phones: no blur, press feedback only.
+ * Entry stays transform-only (see .mis-rise). Money card (OWNER-only) keeps its dark look; only depth is added. */
+.mis-light .mis-wcard {
+  --wc: var(--color-indigo-500); --wc-deep: var(--color-indigo-700);
+  position: relative; isolation: isolate; border-color: color-mix(in oklab, var(--wc) 22%, var(--color-slate-200));
+  background-image:
+    linear-gradient(180deg, color-mix(in oklab, var(--color-white) 85%, transparent) 0, transparent 38%),
+    radial-gradient(120% 90% at 100% 0%, color-mix(in oklab, var(--wc) 11%, transparent), transparent 62%),
+    linear-gradient(160deg, color-mix(in oklab, var(--wc) 4%, var(--color-white)), var(--color-white) 70%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.9), 0 1px 2px rgb(15 23 42 / 0.05),
+    0 10px 22px -12px color-mix(in oklab, var(--wc) 38%, transparent), 0 2px 8px -3px rgb(30 41 90 / 0.08);
+  transition: transform var(--mis-d-base) var(--mis-ease), box-shadow var(--mis-d-base) var(--mis-ease), border-color var(--mis-d-base) var(--mis-ease);
+}
+/* Accent bar along the top edge. */
+.mis-light .mis-wcard::before {
+  content: ''; position: absolute; z-index: -1; inset: 0 0 auto 0; height: 3px; border-radius: inherit; pointer-events: none;
+  background: linear-gradient(90deg, var(--wc), color-mix(in oklab, var(--wc) 25%, transparent) 70%, transparent);
+}
+.mis-light .mis-wcard[data-wmod="production"] { --wc: var(--color-indigo-500); --wc-deep: var(--color-indigo-700); }
+.mis-light .mis-wcard[data-wmod="quality"] { --wc: var(--color-emerald-500); --wc-deep: var(--color-emerald-700); }
+.mis-light .mis-wcard[data-wmod="store"] { --wc: var(--color-amber-500); --wc-deep: var(--color-amber-700); }
+.mis-light .mis-wcard[data-wmod="people"] { --wc: var(--color-sky-500); --wc-deep: var(--color-sky-700); }
+.mis-light .mis-wcard[data-wmod="purchasing"] { --wc: var(--color-violet-500); --wc-deep: var(--color-violet-700); }
+/* Money (OWNER): keep dark card; add glow + glossy edge only. */
+.mis-light .mis-wcard[data-wmod="money"] {
+  --wc: var(--color-emerald-400); border-color: color-mix(in oklab, var(--color-emerald-400) 25%, var(--color-slate-800));
+  background-image: linear-gradient(180deg, rgb(255 255 255 / 0.08), transparent 40%), radial-gradient(110% 90% at 100% 0%, color-mix(in oklab, var(--color-emerald-400) 16%, transparent), transparent 60%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.12), 0 14px 28px -14px color-mix(in oklab, var(--color-emerald-500) 45%, transparent), 0 2px 8px rgb(15 23 42 / 0.2);
+}
+/* Store KPI tiles keep their own tint (tone classes); only depth + a per-tile hairline accent. */
+.mis-light .mis-wtile { --wc: var(--color-amber-500); background-image: linear-gradient(180deg, color-mix(in oklab, var(--color-white) 70%, transparent), transparent 45%); border-color: color-mix(in oklab, currentColor 18%, var(--color-slate-200)); }
+.mis-light .mis-wtile::before { display: none; }
+
+/* Header dot becomes a glowing gradient bead. */
+.mis-light .mis-wcard .mis-wdot { background-image: linear-gradient(135deg, var(--wc), var(--wc-deep)); background-color: var(--wc);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--wc) 18%, transparent), 0 0 10px color-mix(in oklab, var(--wc) 55%, transparent); }
+.mis-light .mis-wcard[data-wmod="money"] .mis-wdot { box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-emerald-400) 20%, transparent), 0 0 12px color-mix(in oklab, var(--color-emerald-400) 60%, transparent); }
+
+/* KPI numbers: bigger, tabular, tight. */
+.mis-light .mis-wcard .mis-kpi { font-size: 2.5rem; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -0.03em; }
+.mis-light .mis-wtile .mis-kpi { font-size: 1.75rem; }
+.mis-light .mis-hkpi { font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+
+/* Bars: keep the inline semantic colour, add gloss + glow on top. */
+.mis-light .mis-wbar { background-image: linear-gradient(180deg, rgb(255 255 255 / 0.38), transparent 55%, rgb(15 23 42 / 0.08));
+  box-shadow: 0 1px 4px -1px color-mix(in oklab, var(--wc, var(--color-indigo-500)) 55%, transparent); }
+
+/* Icon plates: gradient + gloss + coloured glow. */
+.mis-light .mis-wplate { background-image: linear-gradient(145deg, var(--color-indigo-400), var(--color-indigo-700));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.35), 0 4px 10px -3px color-mix(in oklab, var(--color-indigo-600) 55%, transparent); }
+.mis-light .mis-hplate { background-image: linear-gradient(145deg, var(--color-indigo-50), var(--color-indigo-100));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.9), 0 3px 8px -3px color-mix(in oklab, var(--color-indigo-500) 40%, transparent); }
+
+/* Role home cards: layered depth, glossy edge, tone-matched glow. Tone is read from the existing border colour class. */
+.mis-light .mis-hcard {
+  position: relative; box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.85), 0 1px 2px rgb(15 23 42 / 0.05), 0 10px 22px -14px rgb(30 41 90 / 0.28);
+  background-image: linear-gradient(180deg, rgb(255 255 255 / 0.65), transparent 45%);
+  transition: transform var(--mis-d-base) var(--mis-ease), box-shadow var(--mis-d-base) var(--mis-ease);
+}
+.mis-light .mis-hcard.bg-indigo-50 { box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.85), 0 12px 24px -14px color-mix(in oklab, var(--color-indigo-500) 55%, transparent); }
+.mis-light .mis-hcard.bg-amber-50 { box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.85), 0 12px 24px -14px color-mix(in oklab, var(--color-amber-500) 55%, transparent); }
+.mis-light .mis-hcard.bg-red-50 { box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.85), 0 12px 24px -14px color-mix(in oklab, var(--color-red-500) 50%, transparent); }
+.mis-light .mis-hcard.bg-green-50 { box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.85), 0 12px 24px -14px color-mix(in oklab, var(--color-green-500) 50%, transparent); }
+.mis-light .mis-htile { background-image: linear-gradient(180deg, rgb(255 255 255 / 0.6), transparent 55%); box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.9), 0 6px 14px -10px rgb(30 41 90 / 0.3); }
+
+/* Hover: lift + gentle 3D tilt, fine pointers only. */
+@media (hover: hover) and (pointer: fine) {
+  .mis-light .mis-wcard, .mis-light .mis-hcard { transform-style: preserve-3d; }
+  .mis-light .mis-wcard:hover {
+    transform: perspective(900px) translateY(-3px) rotateX(1.2deg) rotateY(-1.2deg);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.95), 0 2px 4px rgb(15 23 42 / 0.05),
+      0 18px 32px -14px color-mix(in oklab, var(--wc) 55%, transparent), 0 4px 12px -4px rgb(30 41 90 / 0.12);
+    border-color: color-mix(in oklab, var(--wc) 42%, var(--color-slate-200));
+  }
+  .mis-light .mis-wcard[data-wmod="money"]:hover { border-color: color-mix(in oklab, var(--color-emerald-400) 45%, var(--color-slate-800)); }
+  .mis-light a:hover > .mis-hplate, .mis-light a:hover .mis-hplate { transform: translateY(-1px) scale(1.06); }
+}
+.mis-light .mis-hplate { transition: transform var(--mis-d-base) var(--mis-ease); }
+/* Phones/touch: no tilt, no blur; the existing .mis-press feedback remains. */
+@media (hover: none), (pointer: coarse) {
+  .mis-light .mis-wcard:hover, .mis-light .mis-hcard:hover { transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mis-light .mis-wcard, .mis-light .mis-hcard, .mis-light .mis-hplate { transition: none; }
+  .mis-light .mis-wcard:hover, .mis-light a:hover .mis-hplate { transform: none; }
+}
+
+/* premium v3: controls */
+/* Buttons, tabs, badges, menus, sidebar, top bar, bottom nav, slide-over. Light-only (.mis-light), CSS only,
+ * var(--color-*) tokens only. Hover under (hover:hover); press via :active; box-shadow/transform only;
+ * no backdrop-filter; everything switched off at the end under prefers-reduced-motion. */
+.mis-light, html:has(.mis-light) {
+  --mis-hl: inset 0 1px 0 rgb(255 255 255 / 0.22);
+  --mis-pressed: inset 0 2px 4px rgb(15 23 42 / 0.22);
+  --mis-glow-primary: 0 6px 16px -6px color-mix(in oklab, var(--color-indigo-600) 60%, transparent);
+  --mis-glow-go: 0 6px 16px -6px color-mix(in oklab, var(--color-emerald-600) 55%, transparent);
+  --mis-glow-danger: 0 6px 16px -6px color-mix(in oklab, var(--color-red-600) 55%, transparent);
+  --mis-pop: 0 2px 4px rgb(15 23 42 / 0.05), 0 12px 28px -6px rgb(30 41 90 / 0.20), 0 28px 56px -20px rgb(30 41 90 / 0.28);
+}
+
+/* ── Buttons (kit Button + .mis-action): one recipe, 44px, 8px icon gap, 12px radius ── */
+.mis-light .mis-btn, .mis-light .mis-action {
+  gap: 0.5rem; line-height: 1.25; font-weight: 600; letter-spacing: -0.005em;
+  transition: transform var(--mis-d-base) var(--mis-ease), box-shadow var(--mis-d-base) var(--mis-ease), background-color var(--mis-d-fast) var(--mis-ease), border-color var(--mis-d-fast) var(--mis-ease), color var(--mis-d-fast) var(--mis-ease);
+}
+.mis-light .mis-action { padding-inline: 1rem; font-size: 0.9375rem; }
+.mis-light .mis-btn-primary, .mis-light .mis-action-primary {
+  background-color: var(--color-indigo-600); color: var(--color-white); border: 1px solid var(--color-indigo-700);
+  background-image: linear-gradient(180deg, var(--color-indigo-500) 0%, var(--color-indigo-600) 52%, var(--color-indigo-700) 100%);
+  box-shadow: var(--mis-hl), 0 1px 2px rgb(30 27 75 / 0.28), var(--mis-glow-primary);
+}
+.mis-light .mis-btn-go, .mis-light .mis-action-go {
+  background-color: var(--color-emerald-600); color: var(--color-white); border: 1px solid var(--color-emerald-700);
+  background-image: linear-gradient(180deg, var(--color-emerald-500) 0%, var(--color-emerald-600) 52%, var(--color-emerald-700) 100%);
+  box-shadow: var(--mis-hl), 0 1px 2px rgb(6 78 59 / 0.28), var(--mis-glow-go);
+}
+.mis-light .mis-btn-danger {
+  background-color: var(--color-red-600); color: var(--color-white); border: 1px solid var(--color-red-700);
+  background-image: linear-gradient(180deg, var(--color-red-500) 0%, var(--color-red-600) 52%, var(--color-red-700) 100%);
+  box-shadow: var(--mis-hl), 0 1px 2px rgb(127 29 29 / 0.28), var(--mis-glow-danger);
+}
+.mis-light .mis-btn-secondary, .mis-light .mis-action-quiet {
+  background-color: var(--color-white); color: var(--color-slate-900); border: 1px solid var(--mis-border-strong);
+  background-image: linear-gradient(180deg, var(--color-white), var(--color-slate-50));
+  box-shadow: inset 0 1px 0 var(--color-white), 0 1px 2px rgb(15 23 42 / 0.06);
+}
+.mis-light .mis-btn-ghost { color: var(--color-slate-700); background-color: transparent; border: 1px solid transparent; }
+@media (hover: hover) {
+  .mis-light .mis-btn-primary:hover:not(:disabled), .mis-light .mis-action-primary:hover:not(:disabled) {
+    background-color: var(--color-indigo-700);
+    background-image: linear-gradient(180deg, var(--color-indigo-400) 0%, var(--color-indigo-500) 50%, var(--color-indigo-600) 100%);
+    box-shadow: var(--mis-hl), 0 2px 4px rgb(30 27 75 / 0.25), 0 10px 22px -6px color-mix(in oklab, var(--color-indigo-600) 70%, transparent);
+  }
+  .mis-light .mis-btn-go:hover:not(:disabled), .mis-light .mis-action-go:hover:not(:disabled) {
+    background-image: linear-gradient(180deg, var(--color-emerald-400) 0%, var(--color-emerald-500) 50%, var(--color-emerald-600) 100%);
+    box-shadow: var(--mis-hl), 0 2px 4px rgb(6 78 59 / 0.25), 0 10px 22px -6px color-mix(in oklab, var(--color-emerald-600) 65%, transparent);
+  }
+  .mis-light .mis-btn-danger:hover:not(:disabled) {
+    background-image: linear-gradient(180deg, var(--color-red-400) 0%, var(--color-red-500) 50%, var(--color-red-600) 100%);
+    box-shadow: var(--mis-hl), 0 2px 4px rgb(127 29 29 / 0.25), 0 10px 22px -6px color-mix(in oklab, var(--color-red-600) 65%, transparent);
+  }
+  .mis-light .mis-btn-secondary:hover:not(:disabled), .mis-light .mis-action-quiet:hover:not(:disabled) {
+    background-color: var(--color-indigo-50); border-color: var(--mis-border-hover); color: var(--color-indigo-900);
+    background-image: linear-gradient(180deg, var(--color-white), var(--color-indigo-50));
+    box-shadow: inset 0 1px 0 var(--color-white), 0 4px 10px -4px rgb(30 41 90 / 0.18);
+  }
+  .mis-light .mis-btn-ghost:hover:not(:disabled) { background-color: var(--color-slate-100); color: var(--color-slate-900); box-shadow: none; transform: none; }
+}
+/* Pressed: sinks 1px, glow gone, inner shadow. */
+.mis-light .mis-btn:active:not(:disabled), .mis-light .mis-action:active:not(:disabled) {
+  transform: translateY(1px) scale(var(--mis-press-scale)); transition-duration: var(--mis-d-fast);
+  box-shadow: var(--mis-pressed);
+}
+.mis-light .mis-btn-secondary:active:not(:disabled), .mis-light .mis-action-quiet:active:not(:disabled) { background-image: none; background-color: var(--color-slate-100); box-shadow: inset 0 2px 3px rgb(15 23 42 / 0.12); }
+.mis-light .mis-btn-ghost:active:not(:disabled) { background-color: var(--color-slate-200); box-shadow: none; }
+.mis-light .mis-btn:disabled, .mis-light .mis-action:disabled { background-image: none; box-shadow: none; }
+.mis-light .mis-btn-primary:disabled { background-color: var(--color-indigo-300); border-color: var(--color-indigo-300); }
+.mis-light .mis-btn-go:disabled { background-color: var(--color-emerald-300); border-color: var(--color-emerald-300); }
+.mis-light .mis-btn-danger:disabled { background-color: var(--color-red-300); border-color: var(--color-red-300); }
+.mis-light .mis-btn-secondary:disabled { background-color: var(--color-slate-50); border-color: var(--color-slate-200); }
+.mis-light .mis-btn:focus-visible, .mis-light .mis-action:focus-visible { outline: 2px solid var(--mis-ring); outline-offset: 2px; }
+.mis-light .mis-btn > svg, .mis-light .mis-action > svg { flex-shrink: 0; }
+
+/* ── Row three-dot trigger + popover menus ── */
+.mis-row-trigger { border-radius: var(--mis-r-control); }
+html:has(.mis-light) [class*="z-[601]"]:has(> .mis-menu-list) {
+  border-radius: 0.875rem; padding: 0.375rem; border: 1px solid var(--mis-border);
+  background-color: var(--color-white); box-shadow: var(--mis-pop);
+}
+.mis-menu-list { gap: 2px; }
+.mis-menu-list .mis-menu-item { border-radius: 0.625rem; padding-inline: 0.75rem; transition: background-color var(--mis-d-fast) var(--mis-ease), color var(--mis-d-fast) var(--mis-ease); }
+.mis-menu-list .mis-menu-item:active { background-color: var(--color-indigo-100); }
+.mis-menu-list > [class*="text-red-700"] { margin-top: 0.25rem; position: relative; }
+.mis-menu-list > [class*="text-red-700"]::before { content: ''; position: absolute; left: 0.75rem; right: 0.75rem; top: -0.25rem; height: 1px; background: var(--color-slate-100); }
+
+/* ── Tabs ── */
+.mis-light .mis-tab { border-top-left-radius: 0.625rem; border-top-right-radius: 0.625rem; padding-inline: 1rem; letter-spacing: -0.005em; transition: color var(--mis-d-fast) var(--mis-ease), background-color var(--mis-d-fast) var(--mis-ease); }
+.mis-light .mis-tab[aria-selected="true"] { font-weight: 600; }
+@media (hover: hover) { .mis-light .mis-tab[aria-selected="false"]:hover { background-color: var(--color-slate-100); } }
+.mis-light [data-tab-indicator] { background-image: linear-gradient(90deg, var(--color-indigo-500), var(--color-indigo-700)); box-shadow: 0 0 8px color-mix(in oklab, var(--color-indigo-500) 45%, transparent); }
+
+/* ── Status badge ── */
+.mis-light .mis-badge { min-height: 1.5rem; line-height: 1.25rem; font-weight: 600; letter-spacing: 0.005em; box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.6), 0 1px 1px rgb(15 23 42 / 0.04); }
+.mis-light .mis-badge [data-badge-dot] { box-shadow: 0 0 0 2.5px color-mix(in oklab, currentColor 16%, transparent); }
+
+/* ── Filter bar (sticky) ── */
+.mis-light .mis-filterbar { box-shadow: 0 1px 0 rgb(15 23 42 / 0.03), 0 8px 16px -12px rgb(30 41 90 / 0.18); }
+@media (min-width: 1024px) { .mis-light .mis-filterbar { border-radius: 0.875rem; box-shadow: var(--shadow-card); } }
+
+/* ── Slide-over / sheet ── */
+.mis-light .mis-sheet, html:has(.mis-light) .mis-sheet { box-shadow: -2px 0 6px rgb(15 23 42 / 0.05), -24px 0 56px -16px rgb(30 41 90 / 0.32); }
+.mis-light .mis-sheet.mis-slide-y, html:has(.mis-light) .mis-sheet.mis-slide-y { box-shadow: 0 -2px 6px rgb(15 23 42 / 0.05), 0 -20px 48px -16px rgb(30 41 90 / 0.32); }
+.mis-light .mis-sheet > header, html:has(.mis-light) .mis-sheet > header { padding: 1rem 1.25rem; box-shadow: 0 1px 0 rgb(15 23 42 / 0.02), 0 6px 12px -10px rgb(30 41 90 / 0.18); }
+.mis-light .mis-sheet > div, html:has(.mis-light) .mis-sheet > div { padding-inline: 1.25rem; }
+.mis-light .mis-sheet > footer, html:has(.mis-light) .mis-sheet > footer { padding: 0.875rem 1.25rem; background-color: color-mix(in oklab, var(--color-slate-50) 70%, var(--color-white)); box-shadow: 0 -6px 12px -10px rgb(30 41 90 / 0.18); }
+
+/* ── Desktop sidebar: depth, active gradient pill + glow, icon plates, tidy dividers ── */
+.mis-sidebar { background-image: linear-gradient(180deg, color-mix(in oklab, var(--color-indigo-500) 7%, transparent), transparent 220px); box-shadow: inset -1px 0 0 rgb(255 255 255 / 0.05), 10px 0 28px -18px rgb(0 0 0 / 0.55); z-index: 10; }
+.mis-sidebar .mis-nav-item { margin-top: 2px; gap: 0.75rem; padding-inline: 0.5rem 0.75rem; font-weight: 500; letter-spacing: -0.005em; }
+.mis-sidebar .mis-nav-plate { display: flex; width: 2rem; height: 2rem; align-items: center; justify-content: center; border-radius: 0.625rem; background-color: rgb(255 255 255 / 0.05); transition: background-color var(--mis-d-fast) var(--mis-ease), box-shadow var(--mis-d-base) var(--mis-ease), transform var(--mis-d-base) var(--mis-ease); }
+.mis-sidebar .mis-nav-plate > .mis-nav-icon { width: 1.25rem; height: 1.25rem; }
+.mis-sidebar .mis-nav-plate > span { right: -0.125rem; top: -0.125rem; box-shadow: 0 0 0 2px var(--color-slate-900); }
+@media (hover: hover) { .mis-sidebar .mis-nav-item:hover .mis-nav-plate { background-color: rgb(255 255 255 / 0.12); } }
+.mis-sidebar .mis-nav-item[aria-current="page"] {
+  background-image: linear-gradient(135deg, var(--color-indigo-500), var(--color-indigo-700));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.22), 0 1px 2px rgb(0 0 0 / 0.3), 0 8px 20px -8px color-mix(in oklab, var(--color-indigo-500) 80%, transparent);
+}
+.mis-sidebar .mis-nav-item[aria-current="page"] .mis-nav-plate { background-color: rgb(255 255 255 / 0.18); box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.25); }
+.mis-sidebar .mis-nav-item:active { transform: scale(0.985); }
+.mis-sidebar .mis-nav-rule { height: 1px; border: 0; background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.12), transparent); margin: 0.25rem 0.5rem 0.75rem; }
+.mis-sidebar nav > div:not(:first-of-type) { margin-top: 1.25rem; }
+.mis-sidebar .mis-avatar { background-image: linear-gradient(135deg, var(--color-indigo-400), var(--color-indigo-700)); box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.3), 0 0 0 2px rgb(255 255 255 / 0.1); }
+/* Collapsed rail: plates centred. */
+@media (max-width: 1279px) { .mis-sidebar .mis-nav-item { justify-content: center; padding-inline: 0; } }
+
+/* ── Top bars: layered shadow (desktop) / flat layered (phone, no blur) ── */
+.mis-topbar { box-shadow: 0 1px 0 rgb(15 23 42 / 0.04), 0 6px 16px -10px rgb(30 41 90 / 0.20), 0 14px 28px -18px rgb(30 41 90 / 0.12); }
+.mis-phonebar { box-shadow: 0 1px 0 var(--color-slate-100), 0 6px 14px -10px rgb(30 41 90 / 0.22); }
+
+/* ── Phone bottom nav: active pill behind the icon, icon lifts ── */
+.mis-bnav { box-shadow: 0 -1px 0 rgb(15 23 42 / 0.03), 0 -10px 24px -14px rgb(30 41 90 / 0.22); }
+.mis-bnav-item { gap: 0.25rem; padding-block: 0.375rem; }
+.mis-bnav-item .mis-bnav-icon { display: inline-flex; width: 3.25rem; height: 1.75rem; align-items: center; justify-content: center; border-radius: 9999px; transition: transform var(--mis-d-base) var(--mis-ease), background-color var(--mis-d-base) var(--mis-ease), box-shadow var(--mis-d-base) var(--mis-ease); }
+.mis-bnav-item .mis-bnav-icon > span { right: 0.25rem; top: -0.125rem; box-shadow: 0 0 0 2px var(--color-white); }
+.mis-bnav-item[aria-current="page"] .mis-bnav-icon, .mis-bnav-item[data-active="true"] .mis-bnav-icon {
+  background-image: linear-gradient(180deg, var(--color-indigo-50), var(--color-indigo-100)); transform: translateY(-1px);
+  box-shadow: inset 0 0 0 1px var(--color-indigo-200), 0 4px 10px -4px color-mix(in oklab, var(--color-indigo-500) 45%, transparent);
+}
+.mis-bnav-item[aria-current="page"] > span:last-child, .mis-bnav-item[data-active="true"] > span:last-child { color: var(--color-indigo-700); }
+
+@media (prefers-reduced-motion: reduce) {
+  .mis-light .mis-btn, .mis-light .mis-action, .mis-light .mis-tab, .mis-sidebar .mis-nav-plate, .mis-bnav-item .mis-bnav-icon, .mis-menu-list .mis-menu-item { transition: none; }
+  .mis-light .mis-btn:active:not(:disabled), .mis-light .mis-action:active:not(:disabled), .mis-sidebar .mis-nav-item:active,
+  .mis-bnav-item[aria-current="page"] .mis-bnav-icon, .mis-bnav-item[data-active="true"] .mis-bnav-icon { transform: none; }
+}
+
+/* premium v3: sticky action column. A wide table scrolls inside its box; the row's main action stays pinned and visible. */
+.mis-light .mis-sticky-end { position: sticky; right: 0; z-index: 1; background-color: var(--color-white); box-shadow: -12px 0 14px -12px color-mix(in oklab, var(--color-slate-900) 22%, transparent); }
+.mis-light thead .mis-sticky-end { background-color: color-mix(in oklab, var(--color-white) 80%, var(--color-slate-100)); }
+.mis-light tbody tr:hover .mis-sticky-end { background-color: var(--color-slate-50); }
+
+/* premium v4: richer widgets, luxe wages card, rich empty states, visual Ask Me */
+/* Light only, CSS only, var(--color-*) tokens only (no new hex). Colour never carries meaning alone. */
+.mis-light .mis-wcard[data-wmod] {
+  border-color: color-mix(in oklab, var(--wc) 30%, var(--color-slate-200));
+  background-image:
+    linear-gradient(180deg, color-mix(in oklab, var(--color-white) 70%, transparent) 0, transparent 30%),
+    radial-gradient(130% 100% at 100% 0%, color-mix(in oklab, var(--wc) 26%, transparent), transparent 66%),
+    linear-gradient(165deg, color-mix(in oklab, var(--wc) 13%, var(--color-white)), color-mix(in oklab, var(--wc) 4%, var(--color-white)) 78%);
+}
+.mis-light .mis-wcard[data-wmod]::before { height: 4px; background: linear-gradient(90deg, var(--wc), var(--wc-deep) 45%, color-mix(in oklab, var(--wc) 20%, transparent)); }
+.mis-light .mis-wcard[data-wmod] h2 { color: var(--wc-deep); font-weight: 650; letter-spacing: -0.01em; }
+.mis-light .mis-wcard[data-wmod] .mis-kpi { color: var(--wc-deep); }
+.mis-light .mis-wcard[data-wmod] .mis-wdot { width: 0.625rem; height: 0.625rem; }
+
+/* Empty states: tinted, soft inner glow, never a blank rectangle. */
+.mis-light .mis-wcard[data-wmod] p.border-dashed {
+  border-color: color-mix(in oklab, var(--wc) 35%, var(--color-slate-200)); color: var(--color-slate-600);
+  background-image: linear-gradient(180deg, color-mix(in oklab, var(--wc) 9%, var(--color-white)), color-mix(in oklab, var(--wc) 3%, var(--color-white)));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.8);
+}
+.mis-light .mis-wcard[data-wmod] p.border-dashed svg { color: var(--wc); width: 1.5rem; height: 1.5rem; }
+
+/* Wages accrued (OWNER only): deep navy, gold figure, high contrast. Text colours are set in the markup. */
+.mis-light .mis-wcard[data-wmod="money"] {
+  --wc: var(--color-amber-300); --wc-deep: var(--color-amber-200);
+  border-color: color-mix(in oklab, var(--color-amber-300) 35%, var(--color-indigo-900));
+  background-image:
+    radial-gradient(120% 90% at 100% 0%, color-mix(in oklab, var(--color-amber-300) 22%, transparent), transparent 58%),
+    radial-gradient(90% 80% at 0% 100%, color-mix(in oklab, var(--color-indigo-400) 22%, transparent), transparent 60%),
+    linear-gradient(180deg, rgb(255 255 255 / 0.10), transparent 38%),
+    linear-gradient(140deg, var(--color-indigo-950), var(--color-indigo-900) 55%, var(--color-slate-900));
+  background-color: var(--color-indigo-950);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.18), inset 0 0 0 1px color-mix(in oklab, var(--color-amber-300) 12%, transparent),
+    0 18px 34px -16px color-mix(in oklab, var(--color-indigo-900) 80%, transparent), 0 2px 8px rgb(15 23 42 / 0.25);
+}
+.mis-light .mis-wcard[data-wmod="money"]::before { background: linear-gradient(90deg, var(--color-amber-300), var(--color-amber-100) 40%, transparent); }
+.mis-light .mis-wcard[data-wmod="money"] h2 { color: var(--color-white); }
+.mis-light .mis-wcard[data-wmod="money"] .mis-wdot { background-image: none; background-color: var(--color-amber-300); box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-amber-300) 25%, transparent), 0 0 12px color-mix(in oklab, var(--color-amber-300) 60%, transparent); }
+.mis-light .mis-money-figure { font-size: 2.25rem; line-height: 1.05; letter-spacing: -0.03em; text-shadow: 0 2px 14px color-mix(in oklab, var(--color-amber-300) 35%, transparent); }
+.mis-light .mis-money-bar { background-image: linear-gradient(90deg, var(--color-emerald-400), var(--color-emerald-300)); box-shadow: 0 0 10px color-mix(in oklab, var(--color-emerald-400) 60%, transparent); }
+
+/* Machine board and bars: gloss on the blocks. */
+.mis-light .mis-wcard[data-wmod] [class*="bg-amber-600"], .mis-light .mis-wcard[data-wmod] [class*="bg-amber-500"] { background-image: linear-gradient(180deg, rgb(255 255 255 / 0.28), transparent 60%); }
+
+/* Ask Me answer: step cards with numbered badges, easy to scan. */
+.mis-light .mis-ask-steps { counter-reset: step; display: grid; gap: 0.75rem; }
+.mis-light .mis-ask-step {
+  display: flex; gap: 0.875rem; align-items: flex-start; padding: 0.875rem 1rem; border-radius: 1rem;
+  border: 1px solid var(--color-slate-200); background: linear-gradient(180deg, var(--color-white), color-mix(in oklab, var(--color-indigo-50) 40%, var(--color-white)));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.9), 0 8px 18px -12px color-mix(in oklab, var(--color-indigo-600) 40%, transparent);
+}
+.mis-light .mis-ask-num {
+  display: inline-flex; flex: none; align-items: center; justify-content: center; width: 2rem; height: 2rem; border-radius: 9999px;
+  font-weight: 700; font-size: 0.9375rem; color: var(--color-white);
+  background-image: linear-gradient(145deg, var(--color-indigo-400), var(--color-indigo-700));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.35), 0 4px 10px -3px color-mix(in oklab, var(--color-indigo-600) 55%, transparent);
+}

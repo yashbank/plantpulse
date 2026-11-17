@@ -1,0 +1,59 @@
+import { isUuid } from '@/lib/mis/ids';
+import { requireMisAccess } from '@/server/mis/guard';
+import { getMisRole } from '@/server/mis/roles';
+import { can } from '@/lib/mis/permissions';
+import { getEmployee } from '@/server/mis/employee';
+import { getMonthlyAttendance } from '@/server/mis/attendance';
+import { getPayComponents } from '@/server/mis/pay-components';
+import { getFactoryTimezone } from '@/server/mis/business-rules';
+import { factoryDateKey } from '@/lib/mis/factory-time';
+import { notFound } from 'next/navigation';
+import { EmployeeProfileScreen } from '@/components/mis/employees/employee-profile-screen';
+
+export default async function EmployeeProfilePage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ month?: string }> }) {
+  const { id } = await params;
+  const { month: monthParam } = await searchParams;
+  if (!isUuid(id)) notFound();
+  const user = await requireMisAccess();
+  const role = await getMisRole(user.id);
+  const canWrite = can(role, 'employees.write');
+  // Phase 25 (25.1): the payslip-row toggles are wage STRUCTURE, wages.read, Owner only — a
+  // separate door from `employees.write`, which Admin also holds.
+  const isOwner = can(role, 'wages.read');
+
+  const employee = await getEmployee(id);
+  if (!employee) notFound();
+
+  const timezone = await getFactoryTimezone();
+  const month = monthParam && /^\d{4}-(0[1-9]|1[0-2])$/.test(monthParam) ? monthParam : factoryDateKey(new Date(), timezone).slice(0, 7);
+  const [attendance, payComponents] = await Promise.all([
+    getMonthlyAttendance(id, month),
+    isOwner ? getPayComponents(id) : Promise.resolve(null),
+  ]);
+
+  const present = attendance.filter((a) => ['PRESENT', 'HALF_DAY'].includes(a.status)).length;
+  const absent = attendance.filter((a) => a.status === 'ABSENT').length;
+  const leave = attendance.filter((a) => a.status === 'LEAVE').length;
+  const totalOT = attendance.reduce((s, a) => s + (a.otMinutes ?? 0), 0);
+
+  return (
+    <EmployeeProfileScreen
+      employee={{
+        id: employee.id,
+        name: employee.name,
+        nameHi: employee.nameHi,
+        code: employee.employeeCode,
+        role: employee.role,
+        isActive: employee.isActive,
+        createdAt: employee.createdAt,
+        photoUrl: employee.photoUrl,
+      }}
+      month={month}
+      timezone={timezone}
+      monthStats={{ present, absent, leave, totalOT }}
+      canWrite={canWrite}
+      payComponents={isOwner ? payComponents : null}
+      canViewPayslip={isOwner}
+    />
+  );
+}

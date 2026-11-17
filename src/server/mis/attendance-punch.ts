@@ -1,0 +1,571 @@
+import { randomUUID } from 'node:crypto';
+
+import {
+  isWithinCorrectionWindow,
+  planDayUpdates,
+  workDateFor,
+  type PunchFact,
+} from '@/lib/mis/attendance-day';
+import { dateKeyToDbDate, factoryDateKey, formatFactoryTime } from '@/lib/mis/factory-time';
+import {
+  checkClockInWindow,
+  deriveDaysSplittingStale,
+  hasMissingOutNote,
+  isStaleOpenIn,
+  missingOutNote,
+  openInBefore,
+} from '@/server/mis/attendance-payroll-rules';
+import { notifyLongOvertime } from '@/server/mis/attendance-compliance';
+import { resolveLateGrace } from '@/lib/mis/late-rule';
+import { isLatenessWaived, punchMinutes } from '@/lib/mis/punch-minutes';
+import { punchMinutesNet } from '@/lib/mis/break-minutes';
+import {
+  isIdempotencyKey,
+  isUuid,
+  parkable,
+  rejectable,
+  type ParkReason,
+  type QueuedWriteEnvelope,
+  type QueuedWriteKind,
+} from '@/lib/mis/offline/idempotency';
+import { getCurrentUser } from '@/server/auth';
+import { logAuditEvent } from '@/server/mis/audit';
+import { requirePermission } from '@/server/mis/auth';
+import { resolveEmployeeShiftId } from '@/server/mis/shift-roster';
+import { employeeCodeCandidates } from '@/lib/mis/employee-code-style';
+import { getCorrectionWindowDays, getFactoryTimezone, getLunchBreakMinutes, getRuleValue } from '@/server/mis/business-rules';
+import { runIdempotent, type IdempotentResult, type MisTx, type RunOptions } from '@/server/mis/idempotency';
+import {
+  authenticateDevice,
+  parseHealthReport,
+  recordDeviceSync,
+} from '@/server/mis/kiosk-device';
+
+/**
+ * Punch ingestion — the server side of a badge scan (Phase 13, MIS-240).
+ * Contract: Appendix B. Decisions: D15 (a punch carries the DEVICE's time, and a
+ * clock outside tolerance parks, never clamps), D18 (a retired tablet's punches
+ * still land, flagged), D20 (a day is derived from punches), D21 (immutable
+ * punches; a closed day, an unknown badge and a leaver park), D22 (which day a
+ * punch belongs to is decided on the FACTORY's clock).
+ *
+ * TWO DOORS, ONE FUNCTION. A tablet reaches `ingestDevicePunch` with a device
+ * token; the portal's kiosk screen reaches `submitPunch` with a user session.
+ * Both end in `applyPunch`, inside `runIdempotent`, so a punch lands exactly once
+ * whichever door it used and however many times it was sent (Appendix B §B.7).
+ *
+ * LATE / OT (R2-106): `lateMinutes` and `otMinutes` are derived from the day's clock
+ * times against its shift window (`punchMinutes`), so payroll's OT pay and late
+ * penalty see real figures.
+ *
+ * WHAT THIS NEVER DOES: edit or delete a punch (the database refuses), or overwrite
+ * a day a person edited by hand.
+ */
+
+export const PUNCH_KINDS = ['attendance.punch_in', 'attendance.punch_out'] as const satisfies readonly QueuedWriteKind[];
+export type PunchKind = (typeof PUNCH_KINDS)[number];
+
+export function isPunchKind(value: unknown): value is PunchKind {
+  return typeof value === 'string' && (PUNCH_KINDS as readonly string[]).includes(value);
+}
+
+/** What a scan carries. Only these fields cross the boundary. */
+export type PunchPayload = {
+  /** The employee code the printed badge encodes (D19's `badgeCode`). */
+  badgeCode: string;
+  /** The gate operator who confirmed the face (K1, K9). Recorded as a claim; optional for now (D21). */
+  operatorId?: string;
+  /** The shift the tablet says this person is on — from its pull (D19). A hint, validated here. */
+  shiftId?: string;
+  /**
+   * K2's Fix: this punch re-records an earlier one that parked as an unrecognised badge, for
+   * the person it really was, at the ORIGINAL scan time. Names that parked write's key so it
+   * can be marked resolved. Honoured only for the same device or the same user's own
+   * `BADGE_UNKNOWN` park — it can close nothing else.
+   */
+  correctsKey?: string;
+};
+
+/** JSON-safe: this is what every duplicate of the punch is answered with (§B.3). */
+export type PunchResult = {
+  punchId: string;
+  employeeId: string;
+  employeeName: string;
+  direction: 'IN' | 'OUT';
+  /** The device's time, exactly as recorded — never clamped (D15). */
+  punchedAt: string;
+  /** The attendance day this punch belongs to, in the factory's zone (D22). */
+  workDate: string | null;
+  /** True when the attendance day's clock times were written. */
+  dayRebuilt: boolean;
+  /** Set when a person had edited that day by hand, so the punch was kept but the day was not touched. */
+  dayHeld: 'EDITED_BY_HAND' | null;
+  /** R3 B58: additive. ALREADY_IN = an IN was absorbed by an open stretch; NO_OPEN_IN = an OUT with no IN to pair with. */
+  note?: 'ALREADY_IN' | 'NO_OPEN_IN';
+  /** R2-213: the work day of an earlier clock-in that never got a clock-out and was closed by this scan (MISSING_OUT). */
+  staleClosedWorkDate?: string;
+  /** R2-212: the OT minutes this clock-out wrote on its day; the Supervisor is told when they are long. */
+  otMinutes?: number;
+};
+
+/** Who may confirm a face at the gate (R3 B57). */
+const OPERATOR_ROLES = ['ATTENDANCE_OPERATOR', 'SUPER_ATTENDANCE_OPERATOR', 'ADMIN', 'OWNER'];
+
+type Source =
+  | { kind: 'device'; deviceId: string; revoked: boolean }
+  | { kind: 'user'; userId: string };
+
+/** How far either side of a punch to look for its partners. Twice the longest stretch of work, plus slack. */
+const NEIGHBOURHOOD_MS = 40 * 60 * 60 * 1000;
+
+function parsePayload(payload: unknown): { badgeCode: string; operatorId?: string; shiftId?: string; correctsKey?: string } {
+  const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>;
+  const badge = typeof p.badgeCode === 'string' ? p.badgeCode.trim().toUpperCase() : '';
+  if (!badge || badge.length > 64) throw rejectable('MALFORMED', 'This punch has no badge code.');
+
+  const operatorId = typeof p.operatorId === 'string' && p.operatorId.trim() ? p.operatorId.trim() : undefined;
+  if (operatorId && !isUuid(operatorId)) throw rejectable('MALFORMED', 'This punch names an operator that is not valid.');
+
+  const shiftId = typeof p.shiftId === 'string' && p.shiftId.trim() ? p.shiftId.trim() : undefined;
+  if (shiftId && !isUuid(shiftId)) throw rejectable('MALFORMED', 'This punch names a shift that is not valid.');
+
+  const correctsKey = typeof p.correctsKey === 'string' && p.correctsKey.trim() ? p.correctsKey.trim() : undefined;
+  if (correctsKey && !isIdempotencyKey(correctsKey)) throw rejectable('MALFORMED', 'This punch names an earlier entry that is not valid.');
+
+  return { badgeCode: badge, operatorId, shiftId, correctsKey };
+}
+
+/** R2-213: flag the day of a clock-in that never got its clock-out. Returns its work date, or undefined if there is no such day. */
+async function markMissingOut(
+  tx: MisTx,
+  employeeId: string,
+  staleIn: PunchFact,
+  shifts: Array<{ id: string; startTime: string; endTime: string }>,
+  timeZone: string,
+  closedAt: Date,
+): Promise<string | undefined> {
+  const workDate = workDateFor(staleIn.punchedAt, shifts, timeZone, staleIn.shiftId).workDate;
+  const row = await tx.misAttendance.findUnique({ where: { employeeId_date: { employeeId, date: dateKeyToDbDate(workDate) } } });
+  if (!row || row.clockOut || hasMissingOutNote(row.notes)) return workDate;
+  const notes = [row.notes, missingOutNote(workDate, formatFactoryTime(closedAt, timeZone))].filter(Boolean).join(' | ');
+  await tx.misAttendance.update({ where: { id: row.id }, data: { notes } });
+  return workDate;
+}
+
+/**
+ * The business write for one punch, run inside the idempotency transaction.
+ *
+ * Everything that can refuse it does so BEFORE the punch row is inserted: a throw
+ * rolls the whole transaction back, key claim included, and `runIdempotent` parks
+ * it durably with its payload for a person.
+ */
+async function applyPunch(
+  tx: MisTx,
+  envelope: QueuedWriteEnvelope,
+  source: Source,
+  /**
+   * Phase 23's audited override (Appendix B, the Phase 13 stamp's own words: "apply the
+   * punch through the same path as any other — extract it rather than copying it"). Skips
+   * `EMPLOYEE_INACTIVE` and `CORRECTION_WINDOW_CLOSED` only — never `BADGE_UNKNOWN`, which
+   * has its own resolution (the tablet's Fix, K2, re-recording under `correctsKey`). The
+   * inbox (`queue-resolve.ts`) requires `attendance.write` itself before ever setting this.
+   */
+  overrideFlags?: { skipEmployeeChecks?: boolean },
+): Promise<{ entityType: string; entityId: string; result: PunchResult }> {
+  const requestedDirection = envelope.kind === 'attendance.punch_in' ? 'IN' : 'OUT';
+  const payload = parsePayload(envelope.payload);
+
+  const recordedAt = new Date(envelope.clientRecordedAt);
+  if (Number.isNaN(recordedAt.getTime())) throw rejectable('MALFORMED', 'The recorded time is not a valid date.');
+
+  const [timeZone, windowDays, paidLunch] = await Promise.all([getFactoryTimezone(), getCorrectionWindowDays(), getLunchBreakMinutes()]);
+
+  // Who was scanned? The employee code is unique; a soft-deleted or inactive
+  // person is a different problem from an unknown one, so look without filtering.
+  const employeeSelect = { id: true, name: true, isActive: true, deletedAt: true, payType: true } as const;
+  let employee = await tx.misEmployee.findFirst({ where: { employeeCode: payload.badgeCode }, select: employeeSelect });
+  if (!employee) {
+    // Exact miss: SAFE fallback only (never folds digits-only/partial input). Cleaned exact text wins;
+    // otherwise the well-formed cross-style forms must identify exactly one stored employee, else not found.
+    const [cleaned, ...fallbacks] = employeeCodeCandidates(payload.badgeCode);
+    const toTry = [cleaned, ...fallbacks].filter((c): c is string => !!c && c !== payload.badgeCode);
+    if (toTry.length) {
+      const rows = await tx.misEmployee.findMany({ where: { employeeCode: { in: toTry } }, select: { ...employeeSelect, employeeCode: true } });
+      const direct = rows.filter((r) => r.employeeCode === cleaned);
+      const hits = direct.length ? direct : rows;
+      if (hits.length === 1) employee = hits[0];
+    }
+  }
+  const scanned = `${formatFactoryTime(recordedAt, timeZone)} · code ${payload.badgeCode}`;
+  if (!employee) throw parkable('BADGE_UNKNOWN', `Badge not recognised. Scanned ${scanned}.`);
+  if (!overrideFlags?.skipEmployeeChecks && (!employee.isActive || employee.deletedAt)) {
+    throw parkable('EMPLOYEE_INACTIVE', `${employee.name} is no longer on the active roll. Scanned ${scanned}.`);
+  }
+
+  const lateGrace = await resolveLateGrace((key) => getRuleValue(key), employee.payType); // R2-230
+  const shifts = await tx.misShift.findMany({
+    where: { isActive: true },
+    select: { id: true, name: true, startTime: true, endTime: true },
+  });
+  // R3 B57: a named gate operator must be an active employee who may run the gate. Not retryable.
+  if (payload.operatorId) {
+    const op = await tx.misEmployee.findFirst({
+      where: { id: payload.operatorId },
+      select: { id: true, role: true, isActive: true, deletedAt: true },
+    });
+    if (!op || !op.isActive || op.deletedAt || !OPERATOR_ROLES.includes(String(op.role))) {
+      throw rejectable('BAD_OPERATOR' as ParkReason, 'The gate operator on this punch is not an active attendance operator.');
+    }
+  }
+  // The tablet's shift is a hint, not a fact: it must name a real active shift (R3 B57), else the punch is refused.
+  if (payload.shiftId && !shifts.some((s) => s.id === payload.shiftId)) {
+    throw rejectable('BAD_SHIFT' as ParkReason, 'The shift on this punch is not an active shift.');
+  }
+  // R2-214: no shift hint from the tablet -> the roster entry for the day, else the employee's default (only if still active).
+  const rosterShiftId = payload.shiftId ? null : await resolveEmployeeShiftId(employee.id, factoryDateKey(recordedAt, timeZone), tx);
+  const hintShiftId = payload.shiftId ?? (rosterShiftId && shifts.some((s) => s.id === rosterShiftId) ? rosterShiftId : null);
+
+  // Minimal shift handover (tracker rows 161-176 follow-up): if this device's immediately
+  // preceding punch was processed by a DIFFERENT named operator, this punch is the first one
+  // under the new operator — record the handover. Nothing new flows from the kiosk; this is
+  // derived entirely from operatorId, which R3 B57 already requires and validates above.
+  let handover: { fromOperatorId: string; toOperatorId: string } | null = null;
+  if (source.kind === 'device' && payload.operatorId) {
+    const priorDevicePunch = await tx.misAttendancePunch.findFirst({
+      where: { deviceId: source.deviceId, operatorId: { not: null } },
+      orderBy: { punchedAt: 'desc' },
+      select: { operatorId: true },
+    });
+    if (priorDevicePunch?.operatorId && priorDevicePunch.operatorId !== payload.operatorId) {
+      handover = { fromOperatorId: priorDevicePunch.operatorId, toOperatorId: payload.operatorId };
+    }
+  }
+
+  // The day is a function of ALL this person's active punches (D20). Superseded ones
+  // are not active — `supersededBy: null` is "nothing has replaced me".
+  const nearby = await tx.misAttendancePunch.findMany({
+    where: {
+      employeeId: employee.id,
+      punchedAt: {
+        gte: new Date(recordedAt.getTime() - NEIGHBOURHOOD_MS),
+        lte: new Date(recordedAt.getTime() + NEIGHBOURHOOD_MS),
+      },
+      supersededBy: null,
+    },
+    select: { id: true, direction: true, punchedAt: true, shiftId: true },
+  });
+  const existing: PunchFact[] = nearby.map((r) => ({
+    id: r.id,
+    direction: r.direction,
+    punchedAt: r.punchedAt,
+    shiftId: r.shiftId,
+  }));
+
+  // R2-213: a scan that finds a forgotten clock-in from an earlier day does not close it (nor read "already in");
+  // that clock-in is left without a clock-out (MISSING_OUT) and this scan starts today's stretch.
+  const openIn = openInBefore(existing, recordedAt);
+  const stale = openIn && isStaleOpenIn(openIn, recordedAt, hintShiftId, shifts, timeZone) ? openIn : null;
+  const direction = stale ? 'IN' : requestedDirection;
+
+  // R2-210: a clock-in is only accepted from 30 minutes before the shift starts until it ends.
+  if (direction === 'IN' && !overrideFlags?.skipEmployeeChecks) {
+    const allowed = hintShiftId ? shifts.filter((s) => s.id === hintShiftId) : shifts;
+    const verdict = checkClockInWindow(recordedAt, allowed, timeZone);
+    if (!verdict.allowed) throw rejectable('OUTSIDE_SHIFT_WINDOW' as ParkReason, `${employee.name}: ${verdict.message}`);
+  }
+
+  const punchId = randomUUID();
+  const incoming: PunchFact = { id: punchId, direction, punchedAt: recordedAt, shiftId: hintShiftId };
+  const before = deriveDaysSplittingStale(existing, shifts, timeZone);
+  const after = deriveDaysSplittingStale([...existing, incoming], shifts, timeZone);
+
+  // Which day is this punch for? Normally the day it landed in; a repeated clock-in
+  // inside a stretch is absorbed by it, so fall back to where it would have gone.
+  const ownDay = [...after.values()].find((d) => d.punchIds.includes(punchId));
+  const workDate = ownDay?.workDate ?? workDateFor(recordedAt, shifts, timeZone, hintShiftId).workDate;
+  // R3 B58: say so when the punch changed nothing the person would expect.
+  const note: PunchResult['note'] =
+    direction === 'IN' && !ownDay ? 'ALREADY_IN' : direction === 'OUT' && ownDay && !ownDay.clockIn ? 'NO_OPEN_IN' : undefined;
+
+  if (!overrideFlags?.skipEmployeeChecks && !isWithinCorrectionWindow(workDate, new Date(), windowDays, timeZone)) {
+    throw parkable(
+      'CORRECTION_WINDOW_CLOSED',
+      `${workDate} is past the ${windowDays}-day correction window. A Super Attendance Operator must decide this punch (${employee.name}, ${direction === 'IN' ? 'in' : 'out'}, ${scanned}).`,
+    );
+  }
+
+  await tx.misAttendancePunch.create({
+    data: {
+      id: punchId,
+      idempotencyKey: envelope.key,
+      employeeId: employee.id,
+      direction,
+      // The device's time, raw. A value outside tolerance never gets here (checkTiming
+      // parked it) and is never replaced with now() (D15).
+      punchedAt: recordedAt,
+      deviceId: source.kind === 'device' ? source.deviceId : null,
+      fromRevokedDevice: source.kind === 'device' ? source.revoked : false,
+      operatorId: payload.operatorId ?? null,
+      recordedById: source.kind === 'user' ? source.userId : null,
+      shiftId: hintShiftId,
+    },
+  });
+
+  if (handover && source.kind === 'device') {
+    await tx.misShiftHandover.create({
+      data: {
+        deviceId: source.deviceId,
+        fromOperatorId: handover.fromOperatorId,
+        toOperatorId: handover.toOperatorId,
+        shiftId: hintShiftId,
+        occurredAt: recordedAt,
+      },
+    });
+  }
+
+  // K2's Fix: the earlier scan that parked as an unrecognised badge is now accounted for.
+  // Scoped to the SAME device (or the same user) and to that one reason, so this can close
+  // nothing that belongs to anyone else and nothing that needs a person's judgement.
+  if (payload.correctsKey) {
+    await tx.misQueuedWrite.updateMany({
+      where: {
+        key: payload.correctsKey,
+        status: 'PARKED',
+        parkReason: 'BADGE_UNKNOWN',
+        resolvedAt: null,
+        ...(source.kind === 'device' ? { deviceId: source.deviceId } : { actorId: source.userId }),
+      },
+      data: {
+        resolvedAt: new Date(),
+        resolvedById: source.kind === 'user' ? source.userId : null,
+        resolutionNote: `Re-recorded from the tablet as ${direction === 'IN' ? 'a clock-in' : 'a clock-out'} for ${employee.name} (punch ${punchId}).`,
+      },
+    });
+  }
+
+  const staleClosedWorkDate = stale ? await markMissingOut(tx, employee.id, stale, shifts, timeZone, recordedAt) : undefined;
+
+  // Bring the register in line with what the punches now say.
+  const plan = planDayUpdates(before, after);
+  let dayRebuilt = false;
+  let dayOtMinutes: number | undefined;
+  let dayHeld: PunchResult['dayHeld'] = null;
+
+  for (const day of plan.upsert) {
+    const date = dateKeyToDbDate(day.workDate);
+    const row = await tx.misAttendance.findUnique({ where: { employeeId_date: { employeeId: employee.id, date } }, include: { breaks: true } });
+    const isThisPunchsDay = day.workDate === workDate;
+
+    if (row?.editedAt) {
+      // A person decided this day. The punch is recorded; the day is theirs (D20).
+      if (isThisPunchsDay) dayHeld = 'EDITED_BY_HAND';
+      continue;
+    }
+    if (!row) {
+      // R2-106: late/OT minutes are derived from the punches against the day's shift window.
+      const mins = punchMinutes(day, shifts.find((s) => s.id === day.shiftId), timeZone, lateGrace);
+      await tx.misAttendance.create({
+        data: {
+          employeeId: employee.id,
+          date,
+          shiftId: day.shiftId,
+          status: 'PRESENT',
+          clockIn: day.clockIn,
+          clockOut: day.clockOut,
+          lateMinutes: mins.lateMinutes ?? 0,
+          otMinutes: mins.otMinutes ?? 0,
+        },
+      });
+    } else {
+      // A derived time wins; a null (only one side has arrived) never erases what is there.
+      const clockIn = day.clockIn ?? row.clockIn;
+      const clockOut = day.clockOut ?? row.clockOut;
+      const shiftId = day.shiftId ?? row.shiftId;
+      // R2-106: minutes follow the merged clock times; an unknown side keeps the stored figure.
+      const mins = punchMinutesNet({ workDate: day.workDate, clockIn, clockOut, breakOut: row.breakOutAt, breakIn: row.breakInAt, breaks: row.breaks }, shifts.find((s) => s.id === shiftId), timeZone, paidLunch, lateGrace);
+      await tx.misAttendance.update({
+        where: { id: row.id },
+        data: {
+          clockIn,
+          clockOut,
+          shiftId,
+          // Turning up overrides "absent"; it never overrides leave, half-day or late.
+          status: row.status === 'ABSENT' ? 'PRESENT' : row.status,
+          // R2-103: a waived day keeps its waiver through every later punch.
+          lateMinutes: isLatenessWaived(row.notes) ? row.lateMinutes : (mins.lateMinutes ?? row.lateMinutes),
+          otMinutes: mins.otMinutes ?? row.otMinutes,
+        },
+      });
+    }
+    if (isThisPunchsDay) {
+      dayRebuilt = true;
+      if (direction === 'OUT') dayOtMinutes = (await tx.misAttendance.findUnique({ where: { employeeId_date: { employeeId: employee.id, date } }, select: { otMinutes: true } }))?.otMinutes;
+    }
+  }
+
+  // A day the earlier punches had filed and the new one pairs away — e.g. the lone
+  // night clock-out that sat under the wrong date until its clock-in arrived.
+  for (const workDateKey of plan.vacated) {
+    const row = await tx.misAttendance.findUnique({
+      where: { employeeId_date: { employeeId: employee.id, date: dateKeyToDbDate(workDateKey) } },
+    });
+    const derived = before.get(workDateKey);
+    if (!row || row.editedAt || !derived) continue;
+    const isExactlyWhatPunchesMade =
+      (row.clockIn?.getTime() ?? null) === (derived.clockIn?.getTime() ?? null) &&
+      (row.clockOut?.getTime() ?? null) === (derived.clockOut?.getTime() ?? null);
+    if (!isExactlyWhatPunchesMade) continue; // someone else wrote here; leave it
+
+    // R2-106: minutes the punches themselves derived are not a person's edit.
+    const derivedMins = punchMinutes(derived, shifts.find((s) => s.id === (derived.shiftId ?? row.shiftId)), timeZone, lateGrace);
+    const lateFromPunches = row.lateMinutes === (derivedMins.lateMinutes ?? 0);
+    const otFromPunches = row.otMinutes === (derivedMins.otMinutes ?? 0);
+    const untouched =
+      row.status === 'PRESENT' && (row.lateMinutes === 0 || lateFromPunches) && (row.otMinutes === 0 || otFromPunches) && !row.approvedOut && !row.notes;
+    if (untouched) await tx.misAttendance.delete({ where: { id: row.id } });
+    else
+      await tx.misAttendance.update({
+        where: { id: row.id },
+        data: {
+          clockIn: null,
+          clockOut: null,
+          ...(lateFromPunches ? { lateMinutes: 0 } : {}),
+          ...(otFromPunches ? { otMinutes: 0 } : {}),
+        },
+      });
+  }
+
+  return {
+    entityType: 'MisAttendancePunch',
+    entityId: punchId,
+    result: {
+      punchId,
+      employeeId: employee.id,
+      employeeName: employee.name,
+      direction,
+      punchedAt: recordedAt.toISOString(),
+      workDate,
+      dayRebuilt,
+      dayHeld,
+      ...(dayOtMinutes !== undefined ? { otMinutes: dayOtMinutes } : {}),
+      ...(note ? { note } : {}),
+      ...(staleClosedWorkDate ? { staleClosedWorkDate } : {}),
+    },
+  };
+}
+
+async function auditApplied(out: IdempotentResult<PunchResult>, actorId: string | null, deviceId: string | null) {
+  // After commit, never inside the transaction: an audit row for a write that rolled back
+  // would be a record of something that did not happen.
+  if (out.outcome !== 'APPLIED' || !out.result) return;
+  await logAuditEvent({
+    actorId,
+    action: 'ATTENDANCE_PUNCH',
+    entity: 'MisAttendancePunch',
+    entityId: out.result.punchId,
+    after: {
+      employeeId: out.result.employeeId,
+      direction: out.result.direction,
+      punchedAt: out.result.punchedAt,
+      workDate: out.result.workDate,
+      ...(out.result.staleClosedWorkDate ? { missingOutWorkDate: out.result.staleClosedWorkDate } : {}),
+      deviceId,
+    },
+  });
+  // R2-212: no approval gate; the Supervisor is simply told about long overtime. Best-effort, after commit.
+  const r = out.result;
+  if (r.direction === 'OUT' && r.workDate) await notifyLongOvertime([{ employeeId: r.employeeId, workDate: r.workDate, otMinutes: r.otMinutes }]);
+}
+
+/** Read an untrusted body into an envelope, or say precisely why it cannot be one. */
+function toEnvelope(body: unknown): { envelope: QueuedWriteEnvelope } | { verdict: IdempotentResult<PunchResult> } {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  if (!isIdempotencyKey(b.key)) {
+    return { verdict: { outcome: 'REJECTED', reason: 'BAD_KEY', detail: 'The idempotency key is not a UUID.' } };
+  }
+  if (!isPunchKind(b.kind)) {
+    return { verdict: { outcome: 'REJECTED', reason: 'MALFORMED', detail: 'This is not a punch.' } };
+  }
+  const at = typeof b.clientRecordedAt === 'string' ? new Date(b.clientRecordedAt) : null;
+  if (!at || Number.isNaN(at.getTime())) {
+    return { verdict: { outcome: 'REJECTED', reason: 'MALFORMED', detail: 'The recorded time is not a valid date.' } };
+  }
+  return {
+    envelope: { key: b.key, kind: b.kind, payload: b.payload, clientRecordedAt: at.toISOString() },
+  };
+}
+
+/**
+ * A tablet sends a punch. Authenticates by device token FIRST — before the body is
+ * read into anything — and accepts a retired tablet's punches, flagged, because they
+ * are real events that happened (D18). The tablet never chooses its own identity:
+ * `deviceId` comes from the token, not the payload.
+ *
+ * Throws `KioskDeviceError` only for an unauthenticated caller; every verdict about
+ * the punch itself is returned as a value (§B.10.3).
+ */
+export async function ingestDevicePunch(
+  authorizationHeader: string | null | undefined,
+  body: unknown,
+): Promise<IdempotentResult<PunchResult> & { deviceRevoked?: true }> {
+  const device = await authenticateDevice(authorizationHeader, { allowRevoked: true });
+
+  const parsed = toEnvelope(body);
+  if ('verdict' in parsed) return parsed.verdict;
+  const { envelope } = parsed;
+
+  const out = await runIdempotent<PunchResult>(
+    { ...envelope, deviceId: device.id },
+    (tx) => applyPunch(tx, envelope, { kind: 'device', deviceId: device.id, revoked: device.revoked }),
+  );
+
+  // Contact worked, so the staleness card may turn green (D19) — unless the server
+  // itself asked to retry, or the tablet is already retired.
+  if (!device.revoked && out.outcome !== 'RETRY') {
+    const health = (body as { health?: unknown } | null)?.health;
+    await recordDeviceSync(device, parseHealthReport(health));
+  }
+  await auditApplied(out, null, device.id);
+  // R2-181: the punch is kept (D18) but the tablet is told, on this very contact, that it is retired.
+  return device.revoked ? { ...out, deviceRevoked: true } : out;
+}
+
+/**
+ * The portal's kiosk screen records a punch — live, or replayed from the offline
+ * queue. The actor is the user who made it (`queuedBy`) and must be the person signed
+ * in now, or it parks: a punch is never re-attributed to whoever happens to be
+ * signed in when a sync runs (§B.10.2). `attendance.write` is checked inside the
+ * transaction, so a right withdrawn between tap and sync parks as FORBIDDEN.
+ */
+export async function submitPunch(
+  envelope: QueuedWriteEnvelope,
+  options: RunOptions = {},
+): Promise<IdempotentResult<PunchResult>> {
+  const user = await getCurrentUser();
+  if (!user) return { outcome: 'RETRY', detail: 'You are signed out. Sign in and this will send.' };
+
+  const parsed = toEnvelope(envelope);
+  if ('verdict' in parsed) return parsed.verdict;
+  const clean = parsed.envelope;
+
+  const out = await runIdempotent<PunchResult>(
+    { ...clean, deviceId: envelope.deviceId, actorId: envelope.queuedBy ?? user.id },
+    async (tx) => {
+      // An inbox override is by definition someone other than the original actor (the whole
+      // reason it exists — a tablet nobody is holding), so this identity check is deliberately
+      // skipped only when `options.override` is set (§B.10.2 still applies otherwise).
+      if (!options.override && envelope.queuedBy && envelope.queuedBy !== user.id) {
+        throw parkable(
+          'FORBIDDEN',
+          'This punch was recorded by a different user than the one signed in now, so it will not be sent under their name. Ask them to sign in.',
+        );
+      }
+      await requirePermission('attendance.write');
+      return applyPunch(tx, clean, { kind: 'user', userId: user.id }, { skipEmployeeChecks: options.override?.skipEmployeeChecks });
+    },
+    options,
+  );
+
+  await auditApplied(out, user.id, null);
+  return out;
+}

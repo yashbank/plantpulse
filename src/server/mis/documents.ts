@@ -1,0 +1,68 @@
+import { db } from '@/server/db';
+import { requirePermission } from '@/server/mis/auth';
+import { getCurrentUser } from '@/server/auth';
+import { logAuditEvent } from '@/server/mis/audit';
+import { safeHref } from '@/lib/mis/document-library';
+
+/** uploaded_by's FK targets auth.users(id) directly (Supabase's own id),
+ * not user_profiles.id — the two are different UUIDs. Resolve display
+ * names via authId, not id, and write authId on create. */
+export async function withUploaderNames<T extends { uploadedBy: string | null }>(docs: T[]) {
+  const authIds = [...new Set(docs.map((d) => d.uploadedBy).filter((id): id is string => !!id))];
+  if (authIds.length === 0) return docs.map((d) => ({ ...d, uploadedByProfile: null }));
+  const profiles = await db.userProfile.findMany({
+    where: { authId: { in: authIds } },
+    select: { authId: true, name: true, email: true },
+  });
+  const byAuthId = new Map(profiles.map((p) => [p.authId, p]));
+  return docs.map((d) => ({
+    ...d,
+    uploadedByProfile: d.uploadedBy ? (byAuthId.get(d.uploadedBy) ?? null) : null,
+  }));
+}
+
+export async function listDocuments(orderId: string) {
+  await requirePermission('orders.read');
+  const docs = await db.misDocument.findMany({
+    where: { orderId },
+    orderBy: { createdAt: 'desc' },
+  });
+  return withUploaderNames(docs);
+}
+
+/**
+ * What of a `MisDocument` row is safe to put in an audit payload. F-23(9): `filePath` is a
+ * pasted link today, but it can carry a signed URL's token — and Admin (`settings.read`) can
+ * read audit payloads back, so a link written here is a link handed to someone who may not be
+ * the one who should hold it. Everything else about the row is unremarkable and kept.
+ */
+function auditSafeDocument(doc: { id: string; orderId: string; name: string; description: string | null; fileSize: number | null; mimeType: string | null; uploadedBy: string | null; createdAt: Date }) {
+  return { id: doc.id, orderId: doc.orderId, name: doc.name, description: doc.description, fileSize: doc.fileSize, mimeType: doc.mimeType, uploadedBy: doc.uploadedBy, createdAt: doc.createdAt };
+}
+
+export async function addDocument(orderId: string, data: {
+  name: string;
+  description?: string;
+  filePath: string;
+  fileSize?: number;
+  mimeType?: string;
+}) {
+  const actor = await requirePermission('orders.write');
+  // R3 B38: the single choke point for every document write - an unsafe link never reaches the table.
+  const filePath = safeHref(data.filePath);
+  if (filePath === null) throw new Error('The link must be a full http(s) address or a path starting with /.');
+  const user = await getCurrentUser();
+  const rec = await db.misDocument.create({
+    data: { orderId, ...data, filePath, uploadedBy: user?.authId },
+  });
+  await logAuditEvent({ actorId: actor.userId, action: 'ADD_DOCUMENT', entity: 'MisDocument', entityId: rec.id, after: auditSafeDocument(rec) });
+  return rec;
+}
+
+export async function deleteDocument(documentId: string) {
+  const actor = await requirePermission('orders.write');
+  const doc = await db.misDocument.findUnique({ where: { id: documentId } });
+  if (!doc) throw new Error('Document not found');
+  await db.misDocument.delete({ where: { id: documentId } });
+  await logAuditEvent({ actorId: actor.userId, action: 'DELETE_DOCUMENT', entity: 'MisDocument', entityId: documentId, before: auditSafeDocument(doc) });
+}

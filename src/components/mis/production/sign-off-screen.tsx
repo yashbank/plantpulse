@@ -1,0 +1,329 @@
+'use client';
+
+import { Button } from '@/components/mis/kit/button';
+import Link from 'next/link';
+import { useState, useTransition } from 'react';
+
+import { useT } from '@/components/mis/shell/locale-provider';
+import { fmtDateTime } from '@/lib/mis/client-dates';
+
+import {
+  acknowledgeQcFailureAction,
+  setWasteReasonAction,
+  signOffPhaseAction,
+} from '@/app/(mis)/mis/production/sign-off/[phaseId]/actions';
+
+type Blocker =
+  | { kind: 'NO_PRODUCTION' }
+  | { kind: 'WASTE_REASON'; logId: string; loggedAt: string; qtyWaste: number; unit?: string }
+  | { kind: 'QC_FAILURE'; checkId: string; parameterName: string | null; checkTime: string };
+
+export type SignOffScreenProps = {
+  phaseId: string;
+  processName: string;
+  orderId: string;
+  orderNumber: string;
+  status: string;
+  inChargeName: string | null;
+  canSign: boolean;
+  /** R2-330: the viewer is an Admin/Owner signing for the in-charge; a reason is required. */
+  signsOnBehalf?: boolean;
+  output: number;
+  waste: number;
+  wastePercent: number | null;
+  entries: number;
+  unit: string;
+  /** R3 B124: per-unit figures; never summed across units. */
+  byUnit?: { unit: string; produced: number; waste: number; wastePercent: number | null }[];
+  handedOver: { processName: string; output: number } | null;
+  materials: { description: string; quantity: number; unit: string }[];
+  blockers: Blocker[];
+};
+
+const num = (n: number) => n.toLocaleString('en-IN', { maximumFractionDigits: 1 });
+
+/**
+ * The sign-off screen.
+ *
+ * The summary sits above the confirm action and always will (MIS-164). This is
+ * the one moment anybody looks at the phase as a whole, and it is where a wrong
+ * figure gets caught; a confirm button above the numbers turns a check back
+ * into a habit.
+ */
+export function SignOffScreen(props: SignOffScreenProps) {
+  const t = useT();
+  const [isPending, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [notes, setNotes] = useState('');
+  const [reason, setReason] = useState('');
+
+  const wasteBlockers = props.blockers.filter((b) => b.kind === 'WASTE_REASON');
+  const qcBlockers = props.blockers.filter((b) => b.kind === 'QC_FAILURE');
+  const noProduction = props.blockers.some((b) => b.kind === 'NO_PRODUCTION');
+
+  const run = (fn: () => Promise<unknown>) =>
+    startTransition(async () => {
+      setError(null);
+      try {
+        // R3 B127: the actions return an ActionResult; a refusal is data, not a throw.
+        const out = await fn();
+        if (out && typeof out === 'object' && 'ok' in out && (out as { ok: boolean }).ok === false) {
+          setError((out as { detail?: string }).detail ?? 'That did not work.');
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'That did not work.');
+      }
+    });
+
+  return (
+    <div className="mx-auto flex w-full max-w-[420px] flex-col gap-3 pb-24">
+      <section className="mis-rise rounded-2xl border border-slate-200 bg-white p-4 shadow-card">
+        <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+          {t('phase.signOff.title')}
+        </p>
+        <h1 className="mt-1 text-2xl font-bold text-slate-900">{props.processName}</h1>
+        <p className="mt-1 font-mono text-xs text-slate-500">
+          {props.orderNumber} · {t(`phase.status.${props.status}` as 'phase.status.PENDING')}
+        </p>
+        {props.inChargeName && (
+          <p className="mt-2 text-sm text-slate-600">
+            {t('phase.inCharge')}: <span className="font-semibold text-slate-900">{props.inChargeName}</span>
+          </p>
+        )}
+      </section>
+
+      {/* ---- The summary. Everything below this is what the signature claims. ---- */}
+      <section className="mis-rise rounded-2xl border border-slate-200 bg-white p-4 shadow-card">
+        <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+          {t('phase.signOff.whatYouAreSigning')}
+        </p>
+
+        <div className="mt-3">
+          {(props.byUnit && props.byUnit.length > 0
+            ? props.byUnit
+            : [{ unit: props.unit, produced: props.output, waste: props.waste, wastePercent: props.wastePercent }]
+          ).map((u, i) => (
+            <div key={u.unit} className={i > 0 ? 'mt-2' : undefined}>
+              <p className="text-4xl font-bold leading-none text-slate-900">
+                {num(u.produced)}
+                {i === 0 && props.handedOver && (
+                  <span className="text-lg font-bold text-slate-400">/{num(props.handedOver.output)}</span>
+                )}
+              </p>
+              <p className="mt-1 text-sm text-slate-500">
+                {t('phase.summary.output')} ({u.unit})
+                {i === 0 && props.handedOver && ` · ${t('phase.summary.handedOver')}: ${props.handedOver.processName}`}
+              </p>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-center">
+            {(props.byUnit && props.byUnit.length > 0
+              ? props.byUnit
+              : [{ unit: props.unit, produced: props.output, waste: props.waste, wastePercent: props.wastePercent }]
+            ).map((u) => (
+              <span key={u.unit} className="block text-lg font-bold leading-tight text-amber-800">
+                {num(u.waste)} {u.unit}
+                {u.wastePercent != null && <span className="text-[11px] font-medium"> · {u.wastePercent.toFixed(1)}%</span>}
+              </span>
+            ))}
+            <span className="mt-1 block text-[11px] font-medium text-amber-800/80">{t('phase.summary.waste')}</span>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-3 text-center">
+            <span className="block text-2xl font-bold leading-none text-slate-900">{props.entries}</span>
+            <span className="mt-1 block text-[11px] font-medium text-slate-500">
+              {t('phase.summary.entries')}
+            </span>
+          </div>
+        </div>
+
+        {props.materials.length > 0 && (
+          <div className="mt-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+              {t('phase.summary.materials')}
+            </p>
+            <ul className="mt-1 flex flex-col gap-1">
+              {props.materials.map((m) => (
+                <li key={m.description} className="flex justify-between gap-3 text-sm text-slate-600">
+                  <span className="truncate">{m.description}</span>
+                  <span className="shrink-0 font-mono text-xs text-slate-500">
+                    {num(m.quantity)} {m.unit}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </section>
+
+      {/* ---- What is in the way, each with the action that clears it ---- */}
+      {noProduction && (
+        <section className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+          <p className="font-semibold text-slate-900">{t('phase.blocker.noProduction')}</p>
+        </section>
+      )}
+
+      {wasteBlockers.map((blocker) => (
+        <WasteReasonCard
+          key={blocker.logId}
+          blocker={blocker}
+          unit={props.unit}
+          disabled={isPending}
+          onSave={(reason) => run(() => setWasteReasonAction(blocker.logId, reason, props.phaseId))}
+        />
+      ))}
+
+      {qcBlockers.map((blocker) => (
+        <QcFailureCard
+          key={blocker.checkId}
+          blocker={blocker}
+          disabled={isPending}
+          onAcknowledge={(note) =>
+            run(() => acknowledgeQcFailureAction(blocker.checkId, note, props.phaseId))
+          }
+        />
+      ))}
+
+      {error && (
+        <section className="rounded-2xl border border-red-200 bg-red-50 p-4">
+          <p className="font-semibold text-red-900">{error}</p>
+        </section>
+      )}
+
+      {/* ---- The confirm action. Below the numbers, always. ---- */}
+      {props.canSign ? (
+        <>
+          {/* R2-295: optional, but the server insists on it when an earlier phase was skipped. */}
+          <label className="block rounded-2xl border border-slate-200 bg-white p-4">
+            <span className="text-sm font-semibold text-slate-700">{t('phase.signOff.handoverNote')}</span>
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              rows={2}
+              placeholder={t('phase.signOff.handoverNoteHint')}
+              className="mt-2 w-full rounded-xl border border-slate-300 px-3 py-3 text-base"
+            />
+          </label>
+          {props.signsOnBehalf && (
+            // R2-330: an Admin/Owner signs for the in-charge only with a reason; the server refuses without one.
+            <label className="block rounded-2xl border border-amber-200 bg-amber-50 p-4">
+              <span className="text-sm font-semibold text-amber-900">
+                {t('phase.signOff.onBehalfReason')}{props.inChargeName ? ` (${props.inChargeName})` : ''}
+              </span>
+              <textarea
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                rows={2}
+                className="mt-2 w-full rounded-xl border border-amber-300 px-3 py-3 text-base"
+              />
+            </label>
+          )}
+        <Button
+          type="button"
+          variant="go"
+          block
+          loading={isPending}
+          disabled={props.signsOnBehalf && reason.trim().length < 3}
+          onClick={() => run(() => signOffPhaseAction(props.phaseId, props.orderId, notes, props.signsOnBehalf ? reason : undefined))}
+          className="min-h-14 text-lg"
+        >
+          {isPending ? t('phase.signOff.signing') : t('phase.signOff.confirm')}
+        </Button>
+        </>
+      ) : (
+        <section className="rounded-2xl border border-slate-200 bg-white p-4">
+          <p className="text-sm text-slate-600">
+            {props.inChargeName
+              ? `${t('phase.signOff.notInCharge')} ${props.inChargeName}.`
+              : t('phase.signOff.notInCharge')}
+          </p>
+        </section>
+      )}
+
+      <Link
+        href={`/mis/orders/${props.orderId}`}
+        className="mis-press flex min-h-12 w-full touch-manipulation items-center justify-center rounded-xl border border-slate-200 bg-white text-center font-semibold text-slate-700"
+      >
+        {props.orderNumber}
+      </Link>
+    </div>
+  );
+}
+
+function WasteReasonCard({
+  blocker,
+  unit,
+  disabled,
+  onSave,
+}: {
+  blocker: Extract<Blocker, { kind: 'WASTE_REASON' }>;
+  unit: string;
+  disabled: boolean;
+  onSave: (reason: string) => void;
+}) {
+  const t = useT();
+  const [reason, setReason] = useState('');
+  return (
+    <section className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+      <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-800/80">
+        {t('phase.blocker.wasteReason')}
+      </p>
+      <p className="mt-1 font-semibold text-slate-900">
+        {num(blocker.qtyWaste)} {blocker.unit ?? unit} · {fmtDateTime(blocker.loggedAt)}
+      </p>
+      <input
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+        placeholder={t('phase.action.reasonPlaceholder')}
+        className="mt-2 h-12 w-full rounded-xl border border-amber-300 bg-white px-3 text-base text-slate-900 placeholder:text-slate-400"
+      />
+      <button
+        type="button"
+        disabled={disabled || !reason.trim()}
+        onClick={() => onSave(reason)}
+        className="mis-press mis-ripple mt-2 min-h-12 w-full touch-manipulation rounded-xl border border-amber-300 bg-white font-semibold text-amber-900 disabled:opacity-60"
+      >
+        {t('phase.action.saveReason')}
+      </button>
+    </section>
+  );
+}
+
+function QcFailureCard({
+  blocker,
+  disabled,
+  onAcknowledge,
+}: {
+  blocker: Extract<Blocker, { kind: 'QC_FAILURE' }>;
+  disabled: boolean;
+  onAcknowledge: (note: string) => void;
+}) {
+  const t = useT();
+  const [note, setNote] = useState('');
+  return (
+    <section className="rounded-2xl border border-red-200 bg-red-50 p-4">
+      <p className="text-[11px] font-semibold uppercase tracking-wider text-red-800/80">
+        {t('phase.blocker.qcFailure')}
+      </p>
+      <p className="mt-1 font-semibold text-slate-900">
+        {blocker.parameterName ?? 'Quality check'} · {fmtDateTime(blocker.checkTime)}
+      </p>
+      <input
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        placeholder={t('phase.action.acknowledgeNote')}
+        className="mt-2 h-12 w-full rounded-xl border border-red-300 bg-white px-3 text-base text-slate-900 placeholder:text-slate-400"
+      />
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => onAcknowledge(note)}
+        className="mis-press mis-ripple mt-2 min-h-12 w-full touch-manipulation rounded-xl border border-red-300 bg-white font-semibold text-red-900 disabled:opacity-60"
+      >
+        {t('phase.action.acknowledge')}
+      </button>
+    </section>
+  );
+}

@@ -1,0 +1,94 @@
+'use client';
+import { FilterBar } from '@/components/mis/kit/filter-bar';
+import { PageHeader } from '@/components/mis/kit/page-header';
+import { useEffect, useState, useTransition } from 'react';
+import { Button } from '@/components/mis/kit/button';
+import { DataTable, type Column } from '@/components/mis/kit/data-table';
+import { SlideOver } from '@/components/mis/kit/slide-over';
+import { Input } from '@/components/mis/kit/input';
+import { ItemOptionFields } from '@/components/mis/items/item-option-fields';
+import { StatusBadge } from '@/components/mis/kit/status-badge';
+import { saveItemAction, deleteItemAction, restoreItemAction } from '@/app/(mis)/mis/masters/items/actions';
+import { getItemFormOptionsAction, type ItemFormOptions } from '@/app/(mis)/mis/inventory/actions';
+
+type Item = { id: string; code: string; name: string; gsm: string | null; size: string | null; substrate: string | null; coating: string | null; unit: string; isActive: boolean; deletedAt: Date | null };
+type Props = { items: Item[]; canWrite: boolean };
+
+export function ItemScreen({ items, canWrite }: Props) {
+  const [open, setOpen] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<Item | null>(null);
+  const [vals, setVals] = useState({ code: '', name: '', gsm: '', size: '', substrate: '', coating: '', unit: 'KG' });
+  const [search, setSearch] = useState('');
+  const [options, setOptions] = useState<ItemFormOptions | null>(null);
+
+  // GSM / Size / Unit are master dropdowns (R3-MST B32); load them when the form first opens.
+  useEffect(() => {
+    if (!open || options) return;
+    let live = true;
+    void getItemFormOptionsAction().then((r) => { if (live && r.ok) setOptions(r.value); });
+    return () => { live = false; };
+  }, [open, options]);
+  const [isPending, startTransition] = useTransition();
+
+  const filtered = search.trim()
+    ? items.filter(it => it.code.toLowerCase().includes(search.toLowerCase()) || it.name.toLowerCase().includes(search.toLowerCase()) || (it.gsm ?? '').toLowerCase().includes(search.toLowerCase()) || (it.substrate ?? '').toLowerCase().includes(search.toLowerCase()))
+    : items;
+
+  const set = (k: keyof typeof vals) => (e: React.ChangeEvent<HTMLInputElement>) => setVals(v => ({ ...v, [k]: e.target.value }));
+
+  const openAdd = () => { setEditing(null); setVals({ code: '', name: '', gsm: '', size: '', substrate: '', coating: '', unit: 'KG' }); setSaveError(null); setOpen(true); };
+  const openEdit = (it: Item) => { setEditing(it); setVals({ code: it.code, name: it.name, gsm: it.gsm ?? '', size: it.size ?? '', substrate: it.substrate ?? '', coating: it.coating ?? '', unit: it.unit }); setSaveError(null); setOpen(true); };
+
+  const handleSave = () => {
+    startTransition(async () => {
+      const r = await saveItemAction(editing?.id ?? null, vals);
+      if (!r.ok) { setSaveError(r.detail); return; }
+      setOpen(false);
+    });
+  };
+
+  const columns: Column<Item>[] = [
+    { key: 'code', header: 'Code', render: (r) => <span className="font-mono text-sm">{r.code}</span> },
+    { key: 'name', header: 'Name', render: (r) => r.name },
+    { key: 'gsm', header: 'GSM', render: (r) => r.gsm ?? '—' },
+    { key: 'size', header: 'Size', render: (r) => r.size ?? '—' },
+    { key: 'unit', header: 'Unit', render: (r) => r.unit },
+    { key: 'isActive', header: 'Status', render: (r) => <StatusBadge dot tone={r.isActive ? 'good' : 'neutral'}>{r.isActive ? 'Active' : 'Inactive'}</StatusBadge> },
+    { key: 'actions', header: '', render: (r) => (
+      <div className="flex gap-2 justify-end">
+        {!r.deletedAt && canWrite && <Button variant="ghost" onClick={() => openEdit(r)}>Edit</Button>}
+        {!r.deletedAt && canWrite && <Button variant="ghost" onClick={() => startTransition(async () => { await deleteItemAction(r.id); })}>Delete</Button>}
+        {r.deletedAt && canWrite && <Button variant="ghost" onClick={() => startTransition(async () => { await restoreItemAction(r.id); })}>Restore</Button>}
+      </div>
+    )},
+  ];
+
+  return (
+    <div className="mx-auto max-w-5xl flex flex-col gap-4">
+      <PageHeader title="Items" className="mb-0" actions={canWrite ? <Button onClick={openAdd}>+ Add Item</Button> : undefined} />
+      <FilterBar searchLabel="Search items…" query={search} onQuery={setSearch} />
+      <DataTable columns={columns} rows={filtered} rowKey={(r) => r.id} emptyTitle="No items yet" emptyBody="Add stock items to manage inventory." />
+      <SlideOver open={open} onClose={() => setOpen(false)} title={editing ? 'Edit Item' : 'Add Item'}>
+        <div className="flex flex-col gap-4 p-4">
+          <Input label={editing ? 'Code' : 'Code (auto if blank)'} value={vals.code} onChange={set('code')} placeholder="ITM-XXXX" />
+          <Input label="Name" value={vals.name} onChange={set('name')} required />
+          <ItemOptionFields
+            options={options}
+            gsm={vals.gsm} size={vals.size} substrate={vals.substrate} coating={vals.coating} unit={vals.unit}
+            onGsm={(v) => setVals(p => ({ ...p, gsm: v }))}
+            onSize={(v) => setVals(p => ({ ...p, size: v }))}
+            onSubstrate={(v) => setVals(p => ({ ...p, substrate: v }))}
+            onCoating={(v) => setVals(p => ({ ...p, coating: v }))}
+            onUnit={(v) => setVals(p => ({ ...p, unit: v }))}
+          />
+          {saveError && <p role="alert" className="text-sm text-red-600">{saveError}</p>}
+          <div className="flex gap-2 pt-2">
+            <Button onClick={handleSave} disabled={isPending || !vals.name.trim() || (!!editing && !vals.code.trim())}>{isPending ? 'Saving…' : 'Save'}</Button>
+            <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
+          </div>
+        </div>
+      </SlideOver>
+    </div>
+  );
+}

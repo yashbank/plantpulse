@@ -1,0 +1,124 @@
+'use client';
+import { PageHeader } from '@/components/mis/kit/page-header';
+import { Eye, Pencil, Trash2 } from 'lucide-react';
+import { IconAction } from '@/components/mis/kit/icon-action';
+import { ListKpiStrip } from '@/components/mis/kit/list-kpi-strip';
+import { useState, useTransition } from 'react';
+import { Button } from '@/components/mis/kit/button';
+import { useConfirm } from '@/components/ui/confirm-dialog';
+import { DataTable, type Column } from '@/components/mis/kit/data-table';
+import { SlideOver } from '@/components/mis/kit/slide-over';
+import { Input, NumberInput } from '@/components/mis/kit/input';
+import { StatusBadge } from '@/components/mis/kit/status-badge';
+import { Pagination } from '@/components/mis/kit/pagination';
+import { ListToolbar } from '@/components/mis/kit/list-toolbar';
+import { parseView } from '@/lib/mis/pagination';
+import { saveSupplierAction, deleteSupplierAction, restoreSupplierAction } from '@/app/(mis)/mis/suppliers/actions';
+
+type Supplier = { id: string; code: string; name: string; phone: string | null; city: string | null; gstNo: string | null; paymentTermsDays: number | null; isActive: boolean; deletedAt: Date | null };
+type Props = { suppliers: Supplier[]; canWrite: boolean; paging?: { total: number; page: number; params: Record<string, string | undefined> } };
+
+export function SupplierScreen({ suppliers, canWrite, paging }: Props) {
+  const [open, setOpen] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<Supplier | null>(null);
+  const [vals, setVals] = useState({ code: '', name: '', phone: '', address: '', city: '', gstNo: '', paymentDays: '' });
+  const view = parseView(paging?.params.view);
+  const [isPending, startTransition] = useTransition();
+  const [listError, setListError] = useState<string | null>(null);
+  const { confirm, confirmDialog } = useConfirm();
+
+  // R3-MST B29/B31: a refusal comes back as a value and is shown inline; delete asks first.
+  const removeRow = async (r: Supplier) => {
+    if (!(await confirm({ title: 'Delete this supplier?', message: `${r.name} will be hidden from pickers. It can be restored later.`, confirmLabel: 'Delete', destructive: true }))) return;
+    startTransition(async () => { const res = await deleteSupplierAction(r.id); setListError(res.ok ? null : res.detail); });
+  };
+  const restoreRow = (r: Supplier) => startTransition(async () => { const res = await restoreSupplierAction(r.id); setListError(res.ok ? null : res.detail); });
+
+  const filtered = suppliers;
+
+  const set = (k: keyof typeof vals) => (e: React.ChangeEvent<HTMLInputElement>) => setVals(v => ({ ...v, [k]: e.target.value }));
+
+  const openAdd = () => { setEditing(null); setVals({ code: '', name: '', phone: '', address: '', city: '', gstNo: '', paymentDays: '' }); setSaveError(null); setOpen(true); };
+  const openEdit = (s: Supplier) => { setEditing(s); setVals({ code: s.code, name: s.name, phone: s.phone ?? '', address: '', city: s.city ?? '', gstNo: s.gstNo ?? '', paymentDays: s.paymentTermsDays?.toString() ?? '' }); setSaveError(null); setOpen(true); };
+
+  const handleSave = () => {
+    startTransition(async () => {
+      const r = await saveSupplierAction(editing?.id ?? null, { code: vals.code, name: vals.name, phone: vals.phone || undefined, address: vals.address || undefined, city: vals.city || undefined, gstNo: vals.gstNo || undefined, paymentTermsDays: vals.paymentDays ? parseInt(vals.paymentDays) : undefined });
+      if (!r.ok) { setSaveError(r.detail); return; }
+      setOpen(false);
+    });
+  };
+
+  function downloadCsv() {
+    const headers = ['Code', 'Name', 'City', 'Phone', 'GST No', 'Payment Terms (days)', 'Active'];
+    const rows = suppliers.map(s => [s.code, s.name, s.city ?? '', s.phone ?? '', s.gstNo ?? '', s.paymentTermsDays?.toString() ?? '', s.isActive ? 'Yes' : 'No']);
+    const lines = [headers, ...rows].map(row => row.map(c => `"${String(c ?? '').replace(/"/g, '""')}"`).join(','));
+    const blob = new Blob([lines.join('\r\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'suppliers.csv'; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const columns: Column<Supplier>[] = [
+    { key: 'code', header: 'Code', render: (r) => <span className="font-mono text-sm">{r.code}</span> },
+    { key: 'name', header: 'Name', render: (r) => <span>{r.name}</span> },
+    { key: 'city', header: 'City', render: (r) => <span>{r.city ?? '—'}</span> },
+    { key: 'phone', header: 'Phone', render: (r) => <span>{r.phone ?? '—'}</span> },
+    { key: 'terms', header: 'Payment Terms', render: (r) => <span>{r.paymentTermsDays ? `${r.paymentTermsDays} days` : '—'}</span> },
+    { key: 'isActive', header: 'Active', render: (r) => <StatusBadge dot tone={r.isActive ? 'good' : 'neutral'}>{r.isActive ? 'Active' : 'Inactive'}</StatusBadge> },
+    { key: 'actions', header: '', render: (r) => (
+      <div className="flex gap-2 justify-end">
+        <IconAction href={`/mis/suppliers/${r.id}`} label="View" icon={<Eye className="size-5" aria-hidden />} />
+        {!r.deletedAt && canWrite && <IconAction label="Edit" icon={<Pencil className="size-5" aria-hidden />} onClick={() => openEdit(r)} />}
+        {!r.deletedAt && canWrite && <IconAction danger label="Delete" icon={<Trash2 className="size-5" aria-hidden />} onClick={() => removeRow(r)} />}
+        {r.deletedAt && canWrite && <Button variant="ghost" onClick={() => restoreRow(r)}>Restore</Button>}
+      </div>
+    )},
+  ];
+
+  return (
+    <div className="flex flex-col gap-4">
+      <PageHeader
+        title="Suppliers"
+        className="mb-0"
+        actions={
+          <>
+            <Button variant="ghost" onClick={downloadCsv}>↓ CSV</Button>
+            {canWrite && <Button onClick={openAdd}>+ Add Supplier</Button>}
+          </>
+        }
+      />
+      <ListKpiStrip
+        label="Supplier summary"
+        kpis={[
+          { label: 'Total suppliers', value: paging?.total ?? suppliers.length },
+          { label: 'Active suppliers', value: suppliers.filter((s) => s.isActive && !s.deletedAt).length, hint: 'on this page', tone: 'good' },
+          { label: 'Inactive suppliers', value: suppliers.filter((s) => !s.isActive && !s.deletedAt).length, hint: 'on this page' },
+          { label: 'Removed suppliers', value: suppliers.filter((s) => s.deletedAt).length, hint: 'on this page', tone: 'warn' },
+        ]}
+      />
+      <ListToolbar basePath="/mis/suppliers" params={paging?.params ?? {}} searchLabel="Search suppliers…" view={view} />
+      {listError && <p role="alert" className="text-sm text-red-600">{listError}</p>}
+      {confirmDialog}
+      <DataTable columns={columns} rows={filtered} view={view} rowKey={(r) => r.id} emptyTitle="No suppliers yet" emptyBody="Add suppliers to raise purchase orders." />
+      {paging && <Pagination basePath="/mis/suppliers" params={paging.params} page={paging.page} total={paging.total} />}
+      <SlideOver open={open} onClose={() => setOpen(false)} title={editing ? 'Edit Supplier' : 'Add Supplier'}>
+        <div className="flex flex-col gap-4 p-4">
+          <Input label="Code" value={vals.code} onChange={set('code')} required />
+          <Input label="Name" value={vals.name} onChange={set('name')} required />
+          <Input label="Phone" value={vals.phone} onChange={set('phone')} />
+          <Input label="Address" value={vals.address} onChange={set('address')} />
+          <Input label="City" value={vals.city} onChange={set('city')} />
+          <Input label="GST No" value={vals.gstNo} onChange={set('gstNo')} />
+          <NumberInput label="Payment Terms (days)" value={vals.paymentDays} onChange={set('paymentDays')} />
+          {saveError && <p role="alert" className="text-sm text-red-600">{saveError}</p>}
+          <div className="flex gap-2 pt-2">
+            <Button onClick={handleSave} disabled={isPending || !vals.name || !vals.code}>{isPending ? 'Saving…' : 'Save'}</Button>
+            <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
+          </div>
+        </div>
+      </SlideOver>
+    </div>
+  );
+}

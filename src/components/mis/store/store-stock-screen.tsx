@@ -1,0 +1,248 @@
+'use client';
+import { Card, CountUp } from '@/components/mis/kit';
+import { PageHeader } from '@/components/mis/kit/page-header';
+import Link from 'next/link';
+import { DataTable, type Column } from '@/components/mis/kit/data-table';
+import { StatusBadge } from '@/components/mis/kit/status-badge';
+import { ArrowRight } from 'lucide-react';
+import { IconAction } from '@/components/mis/kit/icon-action';
+import { Pagination } from '@/components/mis/kit/pagination';
+import { ListToolbar } from '@/components/mis/kit/list-toolbar';
+import { parseView } from '@/lib/mis/pagination';
+
+type StockRow = {
+  id: string;
+  code: string;
+  sku: string | null;
+  name: string;
+  category: string;
+  unit: string;
+  stockBalance: number;
+  reorderLevel: number | null;
+  belowReorder: boolean;
+  pricePerUnit?: number | null;
+  stockValue?: number | null;
+  stockValueLabel?: string | null;
+  isDemo: boolean;
+};
+
+type Props = {
+  rows: StockRow[];
+  isOwner: boolean;
+  /** Server-formatted total (Owner only). The screen does no money arithmetic. */
+  totalValueLabel?: string | null;
+  paging?: { total: number; page: number; params: Record<string, string | undefined> };
+};
+
+const CATEGORY_LABEL: Record<string, string> = {
+  RAW_MATERIAL: 'Raw Material',
+  CONSUMABLE: 'Consumable',
+  EQUIPMENT: 'Equipment Spare',
+  OTHER: 'Other',
+};
+
+function downloadCsv(rows: StockRow[], isOwner: boolean) {
+  const headers = [
+    'Code', 'SKU', 'Name', 'Category', 'Unit', 'Balance', 'Reorder Level', 'Status',
+    ...(isOwner ? ['Price/Unit (₹)', 'Stock Value (₹)'] : []),
+  ];
+  const data = rows.map((r) => [
+    r.code, r.sku ?? '', r.name,
+    CATEGORY_LABEL[r.category] ?? r.category,
+    r.unit, r.stockBalance.toFixed(2),
+    r.reorderLevel != null ? String(r.reorderLevel) : '',
+    r.stockBalance <= 0 ? 'Out of Stock' : r.belowReorder ? 'Low Stock' : 'OK',
+    ...(isOwner ? [
+      r.pricePerUnit != null ? r.pricePerUnit.toFixed(2) : '',
+      r.stockValue != null ? r.stockValue.toFixed(2) : '',
+    ] : []),
+  ]);
+  const lines = [headers, ...data].map((row) =>
+    row.map((c) => `"${String(c ?? '').replace(/"/g, '""')}"`).join(','),
+  );
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `stock-summary-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export function StoreStockScreen({ rows, isOwner, totalValueLabel = null, paging }: Props) {
+  const search = paging?.params.q ?? '';
+  const categoryFilter = paging?.params.category ?? '';
+  const statusFilter = paging?.params.status ?? '';
+  const view = parseView(paging?.params.view);
+
+  const criticalCount = rows.filter((r) => r.stockBalance <= 0).length;
+  const warnCount = rows.filter((r) => r.belowReorder && r.stockBalance > 0).length;
+
+  const columns: Column<StockRow>[] = [
+    {
+      key: 'sku',
+      header: 'SKU',
+      render: (r) => <span className="font-mono text-xs text-slate-500">{r.sku ?? '—'}</span>,
+    },
+    {
+      key: 'name',
+      header: 'Item',
+      render: (r) => (
+        <div>
+          <Link
+            href={`/mis/store/ledger/${r.id}`}
+            className="font-medium text-slate-900 hover:text-blue-600 hover:underline"
+          >
+            {r.name}
+          </Link>
+          <div className="text-xs text-slate-400">{r.code}</div>
+        </div>
+      ),
+    },
+    {
+      key: 'category',
+      header: 'Category',
+      render: (r) => <span className="text-sm text-slate-600">{CATEGORY_LABEL[r.category] ?? r.category}</span>,
+    },
+    {
+      key: 'balance',
+      header: 'Balance',
+      render: (r) => {
+        const tone = r.stockBalance <= 0 ? 'critical' : r.belowReorder ? 'warning' : 'good';
+        return (
+          <div className="flex flex-col items-start gap-0.5">
+            <StatusBadge dot tone={tone}>
+              {r.stockBalance.toFixed(2)} {r.unit}
+            </StatusBadge>
+            {r.reorderLevel != null && r.belowReorder && (
+              <span className="text-[10px] text-amber-600">Reorder ≥ {r.reorderLevel}</span>
+            )}
+          </div>
+        );
+      },
+    },
+    ...(isOwner
+      ? [
+          {
+            key: 'value',
+            header: 'Value (₹)',
+            render: (r: StockRow) => (
+              <div className="text-right">
+                {r.stockValue != null ? (
+                  <span className="font-mono text-sm">{r.stockValueLabel ?? `₹${r.stockValue.toFixed(2)}`}</span>
+                ) : (
+                  '—'
+                )}
+                {r.isDemo && (
+                  <span className="ml-1 text-[9px] text-amber-500 font-medium">DEMO</span>
+                )}
+              </div>
+            ),
+          },
+        ]
+      : []),
+    {
+      key: 'ledger',
+      header: '',
+      render: (r) => (
+        <IconAction href={`/mis/store/ledger/${r.id}`} label="Ledger →" icon={<ArrowRight className="h-4 w-4" aria-hidden />} />
+      ),
+    },
+  ];
+
+  return (
+    <div className="w-full flex flex-col gap-4">
+      {/* Header */}
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <PageHeader title="Stock Summary" className="mb-0" />
+          <p className="text-sm text-slate-500 mt-0.5">
+            {paging ? paging.total : rows.length} items
+            {criticalCount > 0 && (
+              <span className="ml-2 text-red-600 font-medium">· {criticalCount} out of stock</span>
+            )}
+            {warnCount > 0 && (
+              <span className="ml-2 text-amber-600 font-medium">· {warnCount} below reorder</span>
+            )}
+          </p>
+        </div>
+        <button
+          onClick={() => downloadCsv(rows, isOwner)}
+          className="inline-flex min-h-11 items-center justify-center px-3 text-sm border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-700"
+        >
+          ↓ CSV
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4" aria-label="Stock summary">
+        {([
+          ['Items', paging ? paging.total : rows.length],
+          ['Shown', rows.length],
+          ['Out of stock (shown)', criticalCount],
+          ['Below reorder (shown)', warnCount],
+        ] as const).map(([label, n], i) => (
+          <div key={label} data-testid="stock-kpi-card" className="mis-rise" style={{ animationDelay: `${Math.min(i, 5) * 40}ms` }}>
+            <Card raised className="p-3">
+              <div className="text-sm text-slate-600">{label}</div>
+              <div className="text-2xl font-semibold tabular-nums text-slate-900"><CountUp value={n} format={String} /></div>
+            </Card>
+          </div>
+        ))}
+      </div>
+
+      {/* Owner total value card */}
+      {isOwner && totalValueLabel != null && (
+        <div className="bg-blue-50 border border-blue-100 rounded-xl px-5 py-3 flex items-center gap-3">
+          <div>
+            <div className="text-xs text-blue-500 font-medium">Total Stock Value</div>
+            <div className="text-2xl font-bold text-blue-900 font-mono">
+              {totalValueLabel}
+            </div>
+          </div>
+          <span className="ml-2 text-xs text-amber-500 font-medium">DEMO PRICES</span>
+        </div>
+      )}
+
+      {/* Filters */}
+      <ListToolbar basePath="/mis/store/stock" params={paging?.params ?? {}} searchLabel="Search by name, code or SKU…" view={view}>
+        {(go) => (
+          <>
+        <select
+          aria-label="Category"
+          value={categoryFilter}
+          onChange={(e) => go({ category: e.target.value || undefined })}
+          className="min-h-12 rounded-lg border border-slate-300 bg-white px-3 text-base text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-500"
+        >
+          <option value="">All Categories</option>
+          <option value="RAW_MATERIAL">Raw Material</option>
+          <option value="CONSUMABLE">Consumable</option>
+          <option value="EQUIPMENT">Equipment Spare</option>
+          <option value="OTHER">Other</option>
+        </select>
+        <select
+          aria-label="Status"
+          value={statusFilter}
+          onChange={(e) => go({ status: e.target.value || undefined })}
+          className="min-h-12 rounded-lg border border-slate-300 bg-white px-3 text-base text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-500"
+        >
+          <option value="">All Status</option>
+          <option value="critical">Out of Stock</option>
+          <option value="warning">Low Stock</option>
+          <option value="ok">OK</option>
+        </select>
+          </>
+        )}
+      </ListToolbar>
+
+      <DataTable
+        columns={columns}
+        rows={rows}
+        view={view}
+        rowKey={(r) => r.id}
+        emptyTitle="No items"
+        emptyBody={search || categoryFilter || statusFilter ? 'Try clearing filters.' : 'No items configured.'}
+      />
+      {paging && <Pagination basePath="/mis/store/stock" params={paging.params} page={paging.page} total={paging.total} />}
+    </div>
+  );
+}

@@ -1,0 +1,114 @@
+'use client';
+
+import { PageHeader } from '@/components/mis/kit/page-header';
+import { Pagination } from '@/components/mis/kit/pagination';
+import { ListToolbar } from '@/components/mis/kit/list-toolbar';
+import { EmptyState } from '@/components/mis/kit/empty-state';
+import { Combobox } from '@/components/ui/combobox';
+import { fmtDate as fmtFactoryDate, fmtTime as fmtFactoryTime } from '@/lib/mis/client-dates';
+
+type AuditRow = {
+  id: string;
+  action: string;
+  entity: string;
+  entityId: string | null;
+  actorName: string;
+  createdAt: Date | string;
+  changes: { path: string; from: string; to: string }[];
+  severity: string | null;
+};
+
+interface Props {
+  logs: AuditRow[];
+  /** R2-83: the server-side page — the filters are URL params and the server already applied them. */
+  total: number;
+  page: number;
+  entities: string[];
+  params: { q: string; entity: string; from: string; to: string };
+}
+
+const entityColors: Record<string, string> = {
+  order: 'bg-blue-100 text-blue-700',
+  bom: 'bg-purple-100 text-purple-700',
+  production: 'bg-yellow-100 text-yellow-700',
+  attendance: 'bg-green-100 text-green-700',
+  employee: 'bg-gray-100 text-gray-700',
+  qc: 'bg-orange-100 text-orange-700',
+  po: 'bg-indigo-100 text-indigo-700',
+  grn: 'bg-teal-100 text-teal-700',
+};
+
+function fmtTime(dt: Date | string) {
+  const d = typeof dt === 'string' ? new Date(dt) : dt;
+  return fmtFactoryDate(d, { day: '2-digit', month: 'short' }) + ' ' + fmtFactoryTime(d, { hour: '2-digit', minute: '2-digit', hour12: true });
+}
+
+export function AuditScreen({ logs, total, page, entities, params }: Props) {
+  const filtered = logs;
+  const entityOptions = entities.filter(Boolean).map((e) => ({ value: e, label: e.charAt(0).toUpperCase() + e.slice(1) }));
+
+  return (
+    <div className="w-full space-y-5">
+      <PageHeader title="Audit Log" meta={`${total} events`} className="mis-rise mb-0" />
+
+      <ListToolbar basePath="/mis/audit" params={params} searchLabel="Search actions, actors…" showViewToggle={false}>
+        {(go) => (
+          <>
+            <div className="sm:w-48">
+              <Combobox id="audit-entity" label="Entity" hideLabel clearable value={params.entity || null} options={entityOptions} placeholder="All entities" onChange={(v) => go({ entity: v })} />
+            </div>
+            {(['from', 'to'] as const).map((k) => (
+              <label key={k} className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
+                {k === 'from' ? 'From' : 'To'}
+                <input type="date" value={params[k]} onChange={(e) => go({ [k]: e.target.value })} className="min-h-12 rounded-lg border border-slate-300 bg-white px-3 text-base text-slate-900 focus:outline-2 focus:outline-slate-900" />
+              </label>
+            ))}
+          </>
+        )}
+      </ListToolbar>
+
+      <div className="mis-rise rounded-2xl border border-slate-200 bg-white shadow-card divide-y divide-slate-100">
+        {filtered.length === 0 ? (
+          <EmptyState title="No audit events found" body="Try a wider date range or clear the filters." />
+        ) : (
+          filtered.map((log) => (
+            <details key={log.id} className="group hover:bg-gray-50">
+              <summary className="flex min-h-11 cursor-pointer list-none flex-wrap items-center gap-x-4 gap-y-1 px-5 py-3 [&::-webkit-details-marker]:hidden">
+                <div className="text-xs text-gray-400 whitespace-nowrap sm:w-36 shrink-0">{fmtTime(log.createdAt)}</div>
+                <span className={`text-xs px-2 py-0.5 rounded font-medium shrink-0 ${entityColors[log.entity] ?? 'bg-gray-100 text-gray-600'}`}>
+                  {log.entity}
+                </span>
+                {log.severity === 'WARNING' && (
+                  <span className="text-xs px-2 py-0.5 rounded font-medium shrink-0 bg-amber-100 text-amber-800">Warning</span>
+                )}
+                <div className="min-w-0 flex-1 basis-40 break-words">
+                  <span className="text-sm font-medium text-gray-800">{log.action.replace(/_/g, ' ').replace(/\./g, ' › ')}</span>
+                  {log.entityId && (
+                    <span className="ml-2 break-all text-xs text-gray-400 font-mono">{log.entityId.slice(0, 8)}…</span>
+                  )}
+                </div>
+                <div className="text-sm text-gray-500 shrink-0">{log.actorName}</div>
+                <span className="text-xs text-gray-400 shrink-0">{log.changes.length > 0 ? `${log.changes.length} change${log.changes.length === 1 ? '' : 's'}` : 'no detail'}</span>
+              </summary>
+              {log.changes.length > 0 && (
+                <ul className="space-y-2 bg-gray-50 px-5 py-3 text-sm">
+                  {log.changes.map((c) => (
+                    <li key={c.path} className="min-w-0 break-words">
+                      <span className="font-mono text-xs text-gray-500">{c.path}</span>
+                      <div className="flex flex-wrap items-baseline gap-x-2">
+                        <span className="break-all text-red-700 line-through decoration-red-300">{c.from}</span>
+                        <span aria-hidden className="text-gray-400">→</span>
+                        <span className="break-all font-medium text-green-700">{c.to}</span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </details>
+          ))
+        )}
+      </div>
+      <Pagination basePath="/mis/audit" params={params} page={page} total={total} />
+    </div>
+  );
+}

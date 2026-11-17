@@ -1,0 +1,337 @@
+'use client';
+import { PageHeader } from '@/components/mis/kit/page-header';
+import { useState, useTransition } from 'react';
+import Link from 'next/link';
+import { Button } from '@/components/mis/kit/button';
+import { DataTable, type Column } from '@/components/mis/kit/data-table';
+import { SlideOver } from '@/components/mis/kit/slide-over';
+import { DateInput, Input, NumberInput } from '@/components/mis/kit/input';
+import { Select } from '@/components/mis/kit/select';
+import { PAYMENT_TERMS, PAYMENT_TERMS_LABEL, paymentTermsLabel } from '@/lib/mis/po-terms';
+import { formatFactoryDate } from '@/lib/mis/factory-time';
+import { StatusBadge, type BadgeTone } from '@/components/mis/kit/status-badge';
+import { Card, CardRow } from '@/components/mis/kit/card';
+import { useRouter } from 'next/navigation';
+import { addPoItemAction, removePoItemAction, setPoLineRateAction, submitPoAction, approvePoAction, cancelPoAction, deletePoAction, updatePoAction } from '@/app/(mis)/mis/po/actions';
+import { poPurpose, poPurposeLabel, type PoPurpose } from '@/lib/mis/po-purpose';
+import { isBomNotApprovedDetail } from '@/lib/mis/po-errors';
+import { useConfirm } from '@/components/ui/confirm-dialog';
+import { useToast } from '@/components/ui/toast';
+import { EmptyState } from '@/components/mis/kit/empty-state';
+import type { ActionResult } from '@/lib/mis/action-result';
+import type { PoReconciliation } from '@/server/mis/supplier-invoice';
+
+type CatalogItem = { id: string; name: string; unit: string };
+type FormattedPoItem = {
+  id: string; description: string; quantity: number; receivedQuantity: number; item: { id: string; name: string; unit: string } | null;
+  // Money (D24): present only when the server sent it, i.e. for the Owner.
+  ratePerUnit?: number; rateFormatted?: string; totalFormatted?: string;
+};
+type Po = {
+  id: string; poNumber: string; status: string; bomRef: string | null; notes: string | null;
+  /** R2-272 */
+  deliveryDueDate?: Date | string | null; paymentTerms?: string | null;
+  supplier: { id: string; name: string; phone: string | null } | null;
+  grns: { id: string; grnNumber: string; status: string; createdAt: Date }[];
+};
+type Props = { po: Po; formattedItems: FormattedPoItem[]; total: string | null; catalogItems: CatalogItem[]; canWrite: boolean; canApprove: boolean; suppliers?: { id: string; name: string }[]; approvedBoms?: { orderNumber: string; label: string }[]; /** V2 Epic 1 — PO ↔ GRN ↔ invoice; null until a GRN exists. */ reconciliation?: PoReconciliation | null };
+
+function statusTone(status: string): BadgeTone {
+  switch (status) {
+    case 'DRAFT': return 'neutral';
+    case 'PENDING_APPROVAL': return 'warning';
+    case 'APPROVED': return 'good';
+    case 'RECEIVING': case 'PARTIAL': return 'info';
+    case 'COMPLETE': return 'good';
+    case 'CANCELLED': return 'critical';
+    default: return 'neutral';
+  }
+}
+
+export function PoDetailScreen({ po, formattedItems, total, catalogItems, canWrite, canApprove, reconciliation = null, suppliers = [], approvedBoms = [] }: Props) {
+  const router = useRouter();
+  const { confirm, confirmDialog } = useConfirm();
+  const { toast } = useToast();
+  const [editOpen, setEditOpen] = useState(false);
+  const [editSupplierId, setEditSupplierId] = useState(po.supplier?.id ?? '');
+  const [editPurpose, setEditPurpose] = useState<PoPurpose>(poPurpose(po));
+  const [editBomRef, setEditBomRef] = useState(po.bomRef ?? '');
+  const [editNotes, setEditNotes] = useState(po.notes ?? '');
+  const [editDeliveryDue, setEditDeliveryDue] = useState(po.deliveryDueDate ? String(po.deliveryDueDate).slice(0, 10) : ''); // R2-272
+  const [editTerms, setEditTerms] = useState(po.paymentTerms ?? '');
+  const [addOpen, setAddOpen] = useState(false);
+  const [itemId, setItemId] = useState('');
+  const [description, setDescription] = useState('');
+  const [quantity, setQuantity] = useState('1');
+  const [ratePerUnit, setRatePerUnit] = useState('0');
+  const [isPending, startTransition] = useTransition();
+
+  /** A refusal is shown, never swallowed: the unapproved-BOM one as a popup (D1), the rest as a toast. Returns true on success. */
+  const settle = async (result: ActionResult<unknown>): Promise<boolean> => {
+    if (result.ok) return true;
+    if (isBomNotApprovedDetail(result.detail)) {
+      await confirm({ title: 'BOM is not approved', message: result.detail, confirmLabel: 'OK', cancelLabel: 'Close' });
+    } else {
+      toast('error', result.detail);
+    }
+    return false;
+  };
+  const run = (action: () => Promise<ActionResult<unknown>>) => startTransition(async () => { await settle(await action()); });
+
+  const handleAddItem = () => {
+    if (!description) return;
+    startTransition(async () => {
+      const res = await addPoItemAction(po.id, { itemId: itemId || null, description, quantity: parseFloat(quantity) || 1, ratePerUnit: parseFloat(ratePerUnit) || 0 });
+      const ok = await settle(res);
+      if (!ok) return;
+      if (res.ok && res.value?.warning) toast('info', res.value.warning); // R2-274
+      setItemId(''); setDescription(''); setQuantity('1'); setRatePerUnit('0');
+      setAddOpen(false);
+    });
+  };
+
+  const handleSaveDetails = () => {
+    startTransition(async () => {
+      const ok = await settle(await updatePoAction(po.id, {
+        supplierId: editSupplierId || null, purpose: editPurpose, bomRef: editPurpose === 'FOR_ORDER' ? editBomRef || null : null, notes: editNotes || null,
+        deliveryDueDate: editDeliveryDue || null, paymentTerms: editTerms || null,
+      }));
+      if (ok) setEditOpen(false);
+    });
+  };
+
+  const handleDelete = async () => {
+    if (!(await confirm({ title: 'Delete this draft PO?', message: `${po.poNumber} and its line items will be removed for good.`, confirmLabel: 'Delete', destructive: true }))) return;
+    startTransition(async () => {
+      if (await settle(await deletePoAction(po.id))) router.push('/mis/po');
+    });
+  };
+
+  // The Rate and Total columns exist only when the money does — the Owner's view, not a hidden one.
+  const seesMoney = total !== null;
+  const columns: Column<FormattedPoItem>[] = [
+    { key: 'description', header: 'Description', render: (r) => <div><div>{r.description}</div>{r.item && <div className="text-xs text-slate-500">{r.item.name}</div>}</div> },
+    { key: 'quantity', header: 'Qty', render: (r) => r.quantity },
+    ...(seesMoney ? [
+      { key: 'rate', header: 'Rate', render: (r: FormattedPoItem) => r.rateFormatted ?? '' },
+      { key: 'total', header: 'Total', render: (r: FormattedPoItem) => r.totalFormatted ?? '' },
+    ] : []),
+    { key: 'received', header: 'Received', render: (r) => r.receivedQuantity },
+    { key: 'remaining', header: 'Remaining', render: (r) => (
+      <span className={r.quantity - r.receivedQuantity > 0 ? 'text-amber-600' : 'text-slate-500'}>{r.quantity - r.receivedQuantity}</span>
+    )},
+    { key: 'actions', header: '', render: (r) => (
+      po.status === 'DRAFT' && canWrite
+        ? <Button variant="ghost" onClick={() => startTransition(async () => { await settle(await removePoItemAction(r.id, po.id)); })}>Remove</Button>
+        : po.status === 'PENDING_APPROVAL' && seesMoney && canApprove
+          ? <RateEditor key={r.id + String(r.ratePerUnit)} initial={r.ratePerUnit ?? 0} disabled={isPending} onSave={(v) => run(() => setPoLineRateAction(r.id, po.id, v))} />
+          : null
+    )},
+  ];
+
+  const isDraft = po.status === 'DRAFT';
+  // #6: submit needs at least one line with a quantity above zero.
+  const hasLines = formattedItems.some((i) => i.quantity > 0);
+  const isPendingApproval = po.status === 'PENDING_APPROVAL';
+
+  return (
+    <div className="mx-auto max-w-5xl flex flex-col gap-6">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+        <PageHeader
+          className="mb-0"
+          title={po.poNumber}
+          breadcrumbs={[{ label: 'Purchase orders', href: '/mis/po' }, { label: po.poNumber }]}
+          meta={
+            <span className="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <StatusBadge dot tone={statusTone(po.status)}>{po.status.replace(/_/g, ' ')}</StatusBadge>
+              <Link href={`/mis/print/po/${po.id}`} target="_blank" className="inline-flex min-h-11 items-center text-sm text-blue-600 hover:underline">🖨 Print PO</Link>
+            </span>
+          }
+        />
+        <div className="flex flex-wrap gap-2 sm:flex-shrink-0">
+          {isDraft && canWrite && <Button variant="ghost" onClick={() => setEditOpen(true)} disabled={isPending}>Edit details</Button>}
+          {isDraft && canWrite && (
+            <span title={hasLines ? undefined : 'Add at least one line item'}>
+              <Button onClick={() => run(() => submitPoAction(po.id))} disabled={isPending || !hasLines}>Submit for Approval</Button>
+            </span>
+          )}
+          {isPendingApproval && canApprove && <Button onClick={() => run(() => approvePoAction(po.id))} disabled={isPending}>Approve</Button>}
+          {(isDraft || isPendingApproval) && canWrite && <Button variant="ghost" onClick={() => run(() => cancelPoAction(po.id))} disabled={isPending}>Cancel</Button>}
+          {isDraft && canWrite && <Button variant="danger" onClick={handleDelete} disabled={isPending}>Delete</Button>}
+        </div>
+      </div>
+
+      <Card>
+        <CardRow label="Supplier" value={po.supplier?.name ?? '—'} />
+        {po.supplier?.phone && <CardRow label="Supplier Phone" value={po.supplier.phone} />}
+        <CardRow label="Purpose" value={poPurposeLabel(poPurpose(po))} />
+        {po.bomRef && <CardRow label="BOM Ref" value={po.bomRef} />}
+        {/* R2-272 */}
+        <CardRow label="Delivery due" value={po.deliveryDueDate ? formatFactoryDate(new Date(po.deliveryDueDate), 'UTC') : '—'} />
+        <CardRow label="Payment terms" value={paymentTermsLabel(po.paymentTerms) ?? '—'} />
+        {po.notes && <CardRow label="Notes" value={po.notes} />}
+      </Card>
+
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <h2 className="font-semibold text-slate-800">Line Items</h2>
+          {isDraft && canWrite && <Button onClick={() => setAddOpen(true)}>+ Add Item</Button>}
+        </div>
+        {formattedItems.length === 0 ? (
+          <p className="text-sm text-slate-500 py-4">No items added yet.</p>
+        ) : (
+          <>
+            <DataTable columns={columns} rows={formattedItems} rowKey={(r) => r.id} emptyTitle="No items" />
+            {seesMoney && <div className="flex justify-end text-sm font-semibold text-slate-800 pr-4">Total: {total}</div>}
+          </>
+        )}
+      </div>
+
+      {po.grns.length > 0 && (
+        <div className="flex flex-col gap-3">
+          <h2 className="font-semibold text-slate-800">GRNs</h2>
+          <div className="rounded-lg border border-slate-200 divide-y divide-slate-100">
+            {po.grns.map((grn) => (
+              <div key={grn.id} className="flex items-center justify-between px-4 py-3">
+                <div>
+                  <span className="font-mono text-sm">{grn.grnNumber}</span>
+                  <span className="ml-2 text-xs text-slate-500">{new Date(grn.createdAt).toLocaleDateString('en-IN')}</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <StatusBadge tone={grn.status === 'CONFIRMED' ? 'good' : 'neutral'}>{grn.status}</StatusBadge>
+                  <Link href={`/mis/grn/${grn.id}`} className="text-sm text-blue-600 hover:underline">View</Link>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {reconciliation && (
+        <div className="flex flex-col gap-3">
+          <h2 className="font-semibold text-slate-800">3-way match · PO ↔ GRN ↔ Invoice</h2>
+          <div className="overflow-x-auto rounded-lg border border-slate-200">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                <tr><th className="px-3 py-2">Line</th><th className="px-3 py-2 text-right">Ordered</th><th className="px-3 py-2 text-right">Received</th><th className="px-3 py-2 text-right">Damaged</th><th className="px-3 py-2 text-right">Short</th><th className="px-3 py-2 text-right">Outstanding</th></tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {reconciliation.lines.map((l) => (
+                  <tr key={l.poItemId}>
+                    <td className="px-3 py-2">{l.description}</td>
+                    <td className="px-3 py-2 text-right">{l.ordered}</td>
+                    <td className="px-3 py-2 text-right">{l.received}</td>
+                    <td className={`px-3 py-2 text-right ${l.damaged > 0 ? 'text-amber-700' : ''}`}>{l.damaged}</td>
+                    <td className={`px-3 py-2 text-right ${l.short > 0 ? 'text-red-700' : ''}`}>{l.short}</td>
+                    <td className={`px-3 py-2 text-right ${l.outstanding > 0 ? 'text-amber-700' : 'text-slate-500'}`}>{l.outstanding}</td>
+                  </tr>
+                ))}
+                <tr className="bg-slate-50 font-semibold">
+                  <td className="px-3 py-2">Total</td>
+                  <td className="px-3 py-2 text-right">{reconciliation.totals.ordered}</td>
+                  <td className="px-3 py-2 text-right">{reconciliation.totals.received}</td>
+                  <td className="px-3 py-2 text-right">{reconciliation.totals.damaged}</td>
+                  <td className="px-3 py-2 text-right">{reconciliation.totals.short}</td>
+                  <td className="px-3 py-2 text-right">{reconciliation.totals.outstanding}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div className="text-sm text-slate-600">
+            {reconciliation.invoices.length === 0
+              ? 'No supplier invoice recorded yet — enter it on the GRN before confirming.'
+              : <>Invoices: {reconciliation.invoices.map((i) => `${i.invoiceNo}${i.grnNumber ? ` (${i.grnNumber})` : ''}`).join(', ')}</>}
+          </div>
+          {reconciliation.money === undefined && reconciliation.unpricedInvoices > 0 && reconciliation.invoices.length === reconciliation.unpricedInvoices && (
+            <p className="text-sm text-amber-700">Invoice amount not entered yet — the Owner adds it on the GRN to see the rupee match.</p>
+          )}
+          {reconciliation.money && (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              {([['PO value', reconciliation.money.poValue], ['Received value', reconciliation.money.receivedValue], ['Invoiced', reconciliation.money.invoiced], ['Variance', reconciliation.money.variance]] as const).map(([label, value]) => (
+                <div key={label} className={`rounded-lg border p-3 ${label === 'Variance' && reconciliation.money!.varianceRaw !== 0 ? 'border-amber-300 bg-amber-50' : 'border-slate-200'}`}>
+                  <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
+                  <div className="mt-1 font-semibold text-slate-900">{value}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <SlideOver open={editOpen} onClose={() => setEditOpen(false)} title="Edit PO details">
+        <div className="flex flex-col gap-4 p-4">
+          <Select
+            label="Supplier"
+            value={editSupplierId}
+            onChange={setEditSupplierId}
+            options={[{ value: '', label: '— Select supplier —' }, ...suppliers.map(s => ({ value: s.id, label: s.name }))]}
+          />
+          <Select
+            label="Purpose"
+            value={editPurpose}
+            onChange={(v) => setEditPurpose(v as PoPurpose)}
+            options={[
+              { value: 'FOR_ORDER', label: 'From a BOM requirement' },
+              { value: 'BUFFER_STOCK', label: 'Buffer stock — no BOM' },
+            ]}
+          />
+          {editPurpose === 'FOR_ORDER' ? (
+            approvedBoms.length === 0 ? (
+              <EmptyState title="No approved BOMs yet" body="A PO from a BOM needs an order whose BOM is approved. For a stock top-up, choose Buffer stock instead." />
+            ) : (
+              <Select
+                label="BOM Ref"
+                value={editBomRef}
+                onChange={setEditBomRef}
+                options={[{ value: '', label: '— Select an order with an approved BOM —' }, ...approvedBoms.map(b => ({ value: b.orderNumber, label: b.label }))]}
+              />
+            )
+          ) : (
+            <p className="text-sm text-slate-500">Stock kept on hand. No BOM and no customer order is recorded against this PO.</p>
+          )}
+          <DateInput label="Delivery due date" value={editDeliveryDue} onChange={e => setEditDeliveryDue(e.target.value)} />
+          <Select label="Payment terms" value={editTerms} onChange={setEditTerms} options={[{ value: '', label: '— Not set —' }, ...PAYMENT_TERMS.map((t) => ({ value: t, label: PAYMENT_TERMS_LABEL[t] }))]} />
+          <Input label="Notes" value={editNotes} onChange={e => setEditNotes(e.target.value)} />
+          <div className="flex gap-2 pt-2">
+            <Button onClick={handleSaveDetails} disabled={isPending || (editPurpose === 'FOR_ORDER' && !editBomRef.trim())}>{isPending ? 'Saving…' : 'Save'}</Button>
+            <Button variant="ghost" onClick={() => setEditOpen(false)}>Cancel</Button>
+          </div>
+        </div>
+      </SlideOver>
+
+      <SlideOver open={addOpen} onClose={() => setAddOpen(false)} title="Add Line Item">
+        <div className="flex flex-col gap-4 p-4">
+          <Select
+            label="Item (optional)"
+            value={itemId}
+            onChange={(v) => {
+              const item = catalogItems.find(i => i.id === v);
+              setItemId(v);
+              if (item) setDescription(item.name);
+            }}
+            options={[{ value: '', label: '— None —' }, ...catalogItems.map(i => ({ value: i.id, label: i.name }))]}
+          />
+          <Input label="Description" value={description} onChange={e => setDescription(e.target.value)} required />
+          <NumberInput label="Quantity" value={quantity} onChange={e => setQuantity(e.target.value)} />
+          {seesMoney && <NumberInput label="Rate per Unit (₹)" value={ratePerUnit} onChange={e => setRatePerUnit(e.target.value)} />}
+          <div className="flex gap-2 pt-2">
+            <Button onClick={handleAddItem} disabled={isPending || !description}>{isPending ? 'Adding…' : 'Add Item'}</Button>
+            <Button variant="ghost" onClick={() => setAddOpen(false)}>Cancel</Button>
+          </div>
+        </div>
+      </SlideOver>
+      {confirmDialog}
+    </div>
+  );
+}
+
+/** Owner-only inline rate entry for a line on a PO awaiting approval. */
+function RateEditor({ initial, disabled, onSave }: { initial: number; disabled: boolean; onSave: (v: number) => void }) {
+  const [v, setV] = useState(initial > 0 ? String(initial) : '');
+  return (
+    <div className="flex items-end gap-2">
+      <NumberInput label="Rate (₹)" value={v} onChange={(e) => setV(e.target.value)} />
+      <Button variant="ghost" disabled={disabled || !(parseFloat(v) > 0)} onClick={() => onSave(parseFloat(v))}>Set rate</Button>
+    </div>
+  );
+}

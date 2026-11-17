@@ -1,0 +1,211 @@
+/**
+ * The MIS permission matrix — one table, no scattered ifs.
+ *
+ * Pure and dependency-free so the same matrix answers both the server check
+ * (server/mis/auth.ts, which throws) and the <Can> render helper, and the two
+ * can never disagree. Only the *answer* is sent to the browser, never the table.
+ */
+
+import type { MisRoleName } from './roles';
+
+export const MIS_ACTIONS = [
+  'masters.read',
+  'masters.write',
+  'employees.read',
+  'employees.write',
+  'orders.read',
+  'orders.write',
+  'production.read',
+  'production.write',
+  'qc.read',
+  'qc.write',
+  // R2-311: acknowledge a failed QC check / record a waiver. Held by the QC role, Supervisor (as in-charge), Admin, Owner.
+  'qc.acknowledge',
+  'attendance.read',
+  'attendance.write',
+  // R3 B64: add a note to a register row; no status/time change.
+  'attendance.note',
+  // R2-263: assign or remove shift-roster entries. Held by the register writers AND the Supervisor, who plans the crew.
+  'roster.write',
+  'reports.read',
+  'settings.read',
+  'settings.write',
+  // Money. Owner only, everywhere, always (S9).
+  'wages.read',
+  // AQL accept/reject thresholds. Owner only, same shape as wages.read: a
+  // change here silently re-scores every QC sample going forward, so it is
+  // not something Admin's general settings.write should reach.
+  'aql.read',
+  // MIS user management. Owner only. Admin may set roles strictly below ADMIN on employee rows (B41);
+  // never ADMIN or OWNER. Viewing an existing employee's role change still goes through employees.write.
+  'users.invite',
+  // Inventory, PO, GRN
+  'inventory.read',
+  'inventory.write',
+  'po.read',
+  'po.write',
+  'grn.read',
+  'grn.write',
+  // R2-37: read-only VIEW of PO / GRN lists and detail. Held by every role that reads them, plus QC.
+  // Separate from po.read / grn.read so the QC grant cannot widen traceability, suppliers or the
+  // 3-way-match board (all still gated on po.read / grn.read, which QC does not hold).
+  'po.view',
+  'grn.view',
+  // V2 Epic 1 — the 3-way match board. Read: Owner, Admin, Store Guy. Write (reconcile): Owner, Admin.
+  'supplier_invoice.read',
+  'supplier_invoice.write',
+  // Store module (MIS-280+)
+  'store.read',
+  'store.write',
+  'store.count',   // physical count — owner/admin only
+  // Line clearance (D7, DECISIONS.md). Read is the history view; write is the
+  // clear-line action itself — SUPERVISOR and above only.
+  'clearance.read',
+  'clearance.write',
+  // Job phases and the handover gate (DEVELOPMENT_GUIDE.md Appendix A).
+  // phase.reopen is its own action (Owner and, since R2-331, Admin), because withdrawing a
+  // signature is a different kind of act from moving a phase along.
+  // Note: holding phase.write does NOT let you sign off someone else's phase —
+  // the in-charge identity check in job-phases.ts sits on top of it (D12).
+  'phase.read',
+  'phase.write',
+  'phase.reopen',
+  // Gate tablets (D18): pair, rename and retire a device. Owner and Admin only.
+  // Seeing kiosk health on the attendance home needs only attendance.read.
+  'kiosk.manage',
+  // Owner Danger Zone: back up, clear and restore data. Owner ONLY (not in the Admin list below).
+  'data.reset',
+  // Theme Studio (R8 follow-up): Owner ONLY, its own action so it is not tied to the Danger Zone.
+  'theme.write',
+  // Phase 23 — the parked-writes inbox (Appendix B §B.7). This is the DOOR into
+  // the inbox at all; which ROWS a holder actually sees is filtered again, per
+  // kind, by that kind's own read permission (production.read / attendance.read)
+  // — one action gating three kinds of data was exactly F-13's mistake.
+  'queue.review',
+  // The Approvals inbox (F-13 fix): previously gated by the broad orders.read,
+  // which let QC/Supervisor see it as a side effect of holding order context.
+  // Owner and Admin only, per the sign-off rule this screen exists to enforce.
+  'approvals.read',
+] as const;
+
+export type MisAction = (typeof MIS_ACTIONS)[number];
+
+/**
+ * role → the actions it may perform.
+ *
+ * A role absent from a row simply cannot do that thing. There is no inheritance
+ * and no wildcard: every grant is written down, because a wildcard is how an
+ * attendance operator quietly ends up able to read wages.
+ */
+const MATRIX: Record<MisRoleName, readonly MisAction[]> = {
+  OWNER: MIS_ACTIONS,
+
+  ADMIN: [
+    'masters.read',
+    'masters.write',
+    'employees.read',
+    'employees.write',
+    'orders.read',
+    'orders.write',
+    'production.read',
+    'production.write',
+    'qc.read',
+    'qc.write',
+    'qc.acknowledge', // R2-311
+    'attendance.read',
+    'attendance.write',
+    'attendance.note',
+    'roster.write', // R2-263
+    'reports.read',
+    'settings.read',
+    'settings.write',
+    'inventory.read',
+    'inventory.write',
+    'po.read',
+    'po.write',
+    'grn.read',
+    'grn.write',
+    'po.view',
+    'grn.view',
+    'supplier_invoice.read',
+    'supplier_invoice.write',
+    'store.read',
+    'store.write',
+    'store.count',
+    'clearance.read',
+    'clearance.write',
+    'phase.read',
+    'phase.write',
+    'phase.reopen', // R2-331
+    'kiosk.manage',
+    'queue.review',
+    'approvals.read',
+  ],
+
+  SUPERVISOR: [
+    'masters.read',
+    'employees.read',
+    'orders.read',
+    'production.read',
+    'production.write',
+    'qc.read',
+    'qc.write', // R3 B64
+    'qc.acknowledge', // R2-311
+    'attendance.read',
+    'attendance.note', // R3 B64
+    'roster.write', // R2-263: a Supervisor rosters the floor crew, without attendance.write
+    'reports.read',
+    'inventory.read',
+    'grn.read',
+    'grn.view',
+    'store.read',
+    'clearance.read',
+    'clearance.write',
+    'phase.read',
+    'phase.write',
+    'queue.review', // R2-342: resolves parked floor entries (clearance parks need clearance.write, which it holds)
+  ],
+
+  QC: ['masters.read', 'orders.read', 'production.read', 'qc.read', 'qc.write', 'qc.acknowledge' /* R2-311 */, 'reports.read', 'phase.read', 'po.view', 'grn.view' /* R2-37: read-only */],
+
+  SUPER_ATTENDANCE_OPERATOR: [
+    'employees.read',
+    'attendance.read',
+    'attendance.write',
+    'attendance.note', // R3 B64
+    'roster.write', // R2-263
+    'reports.read',
+    'queue.review',
+  ],
+
+  ATTENDANCE_OPERATOR: ['employees.read', 'attendance.read', 'attendance.write', 'attendance.note' /* R3 B64 */, 'roster.write' /* R2-263 */],
+
+  STORE_GUY: [
+    'orders.read', // R3 B64: read-only Orders tab, no prices
+    'inventory.read',
+    'grn.read',
+    'grn.write',
+    'po.view',
+    'grn.view',
+    'supplier_invoice.read',
+    'po.read',
+    'store.read',
+    'store.write',
+    'store.count',
+  ],
+
+  // A worker has no login at all. The row exists so the matrix is total.
+  WORKER: [],
+};
+
+/** Does this role allow this action? A null role (no MIS record) allows nothing. */
+export function can(role: MisRoleName | null | undefined, action: MisAction): boolean {
+  if (!role) return false;
+  return MATRIX[role].includes(action);
+}
+
+/** Every action this role may perform. Used to build a nav payload in one pass. */
+export function allowedActions(role: MisRoleName | null | undefined): MisAction[] {
+  if (!role) return [];
+  return [...MATRIX[role]];
+}
